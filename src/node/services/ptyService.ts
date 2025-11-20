@@ -219,18 +219,19 @@ export class PTYService {
       log.info(`[PTY] SSH terminal size: ${params.cols}x${params.rows}`);
 
       // Load node-pty or @lydell/node-pty dynamically
-      // Try @lydell/node-pty first (server mode), fall back to node-pty (desktop)
+      // Try @lydell/node-pty first (server mode - always works with prebuilds)
+      // Fall back to node-pty (desktop mode after electron-rebuild)
       // eslint-disable-next-line @typescript-eslint/consistent-type-imports
       let pty: typeof import("node-pty");
       try {
         // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-unsafe-assignment
-        pty = require("node-pty");
-        log.debug("Using node-pty for SSH (rebuilt for Electron)");
+        pty = require("@lydell/node-pty");
+        log.debug("Using @lydell/node-pty for SSH (prebuilt binaries)");
       } catch {
         try {
           // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-unsafe-assignment
-          pty = require("@lydell/node-pty");
-          log.debug("Using @lydell/node-pty for SSH (prebuilt binaries)");
+          pty = require("node-pty");
+          log.debug("Using node-pty for SSH (rebuilt for Electron)");
         } catch (err) {
           log.error("Neither @lydell/node-pty nor node-pty available:", err);
           throw new Error(
