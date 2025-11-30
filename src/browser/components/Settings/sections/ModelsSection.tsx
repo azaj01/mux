@@ -1,7 +1,10 @@
 import React, { useState, useEffect, useCallback } from "react";
-import { Plus, Trash2, Pencil, Check, X, Loader2 } from "lucide-react";
+import { Plus, Loader2 } from "lucide-react";
 import type { ProvidersConfigMap } from "../types";
 import { SUPPORTED_PROVIDERS, PROVIDER_DISPLAY_NAMES } from "@/common/constants/providers";
+import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { useModelLRU } from "@/browser/hooks/useModelLRU";
+import { ModelRow } from "./ModelRow";
 
 interface NewModelForm {
   provider: string;
@@ -20,6 +23,7 @@ export function ModelsSection() {
   const [saving, setSaving] = useState(false);
   const [editing, setEditing] = useState<EditingState | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const { defaultModel, setDefaultModel } = useModelLRU();
 
   // Load config on mount
   useEffect(() => {
@@ -153,164 +157,125 @@ export function ModelsSection() {
   }
 
   // Get all custom models across providers
-  const getAllModels = (): Array<{ provider: string; modelId: string }> => {
-    const models: Array<{ provider: string; modelId: string }> = [];
+  const getCustomModels = (): Array<{ provider: string; modelId: string; fullId: string }> => {
+    const models: Array<{ provider: string; modelId: string; fullId: string }> = [];
     for (const [provider, providerConfig] of Object.entries(config)) {
       if (providerConfig.models) {
         for (const modelId of providerConfig.models) {
-          models.push({ provider, modelId });
+          models.push({ provider, modelId, fullId: `${provider}:${modelId}` });
         }
       }
     }
     return models;
   };
 
-  const allModels = getAllModels();
+  // Get built-in models from KNOWN_MODELS
+  const builtInModels = Object.values(KNOWN_MODELS).map((model) => ({
+    provider: model.provider,
+    modelId: model.providerModelId,
+    fullId: model.id,
+    aliases: model.aliases,
+  }));
+
+  const customModels = getCustomModels();
 
   return (
     <div className="space-y-4">
       <p className="text-muted text-xs">
-        Add custom models to use with your providers. These will appear in the model selector.
+        Manage your models. Click the star to set a default model for new workspaces.
       </p>
 
-      {/* Add new model form */}
-      <div className="border-border-medium bg-background-secondary rounded-md border p-4">
-        <div className="mb-3 text-sm font-medium">Add Custom Model</div>
-        <div className="flex gap-2">
-          <select
-            value={newModel.provider}
-            onChange={(e) => setNewModel((prev) => ({ ...prev, provider: e.target.value }))}
-            className="bg-modal-bg border-border-medium focus:border-accent rounded border px-2 py-1.5 text-sm focus:outline-none"
-          >
-            <option value="">Select provider</option>
-            {SUPPORTED_PROVIDERS.map((p) => (
-              <option key={p} value={p}>
-                {PROVIDER_DISPLAY_NAMES[p]}
-              </option>
-            ))}
-          </select>
-          <input
-            type="text"
-            value={newModel.modelId}
-            onChange={(e) => setNewModel((prev) => ({ ...prev, modelId: e.target.value }))}
-            placeholder="model-id (e.g., gpt-4-turbo)"
-            className="bg-modal-bg border-border-medium focus:border-accent flex-1 rounded border px-2 py-1.5 font-mono text-xs focus:outline-none"
-            onKeyDown={(e) => {
-              if (e.key === "Enter") void handleAddModel();
-            }}
-          />
-          <button
-            type="button"
-            onClick={() => void handleAddModel()}
-            disabled={saving || !newModel.provider || !newModel.modelId.trim()}
-            className="bg-accent hover:bg-accent-dark disabled:bg-border-medium flex items-center gap-1 rounded px-3 py-1.5 text-sm text-white transition-colors disabled:cursor-not-allowed"
-          >
-            <Plus className="h-4 w-4" />
-            Add
-          </button>
+      {/* Custom Models - shown first */}
+      <div className="space-y-1.5">
+        <div className="text-muted text-xs font-medium tracking-wide uppercase">Custom Models</div>
+
+        {/* Add new model form */}
+        <div className="border-border-medium bg-background-secondary rounded-md border p-2">
+          <div className="flex gap-1.5">
+            <select
+              value={newModel.provider}
+              onChange={(e) => setNewModel((prev) => ({ ...prev, provider: e.target.value }))}
+              className="bg-modal-bg border-border-medium focus:border-accent rounded border px-2 py-1 text-xs focus:outline-none"
+            >
+              <option value="">Provider</option>
+              {SUPPORTED_PROVIDERS.map((p) => (
+                <option key={p} value={p}>
+                  {PROVIDER_DISPLAY_NAMES[p]}
+                </option>
+              ))}
+            </select>
+            <input
+              type="text"
+              value={newModel.modelId}
+              onChange={(e) => setNewModel((prev) => ({ ...prev, modelId: e.target.value }))}
+              placeholder="model-id"
+              className="bg-modal-bg border-border-medium focus:border-accent flex-1 rounded border px-2 py-1 font-mono text-xs focus:outline-none"
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void handleAddModel();
+              }}
+            />
+            <button
+              type="button"
+              onClick={() => void handleAddModel()}
+              disabled={saving || !newModel.provider || !newModel.modelId.trim()}
+              className="bg-accent hover:bg-accent-dark disabled:bg-border-medium flex items-center gap-1 rounded px-2 py-1 text-xs text-white transition-colors disabled:cursor-not-allowed"
+            >
+              <Plus className="h-3.5 w-3.5" />
+              Add
+            </button>
+          </div>
+          {error && !editing && <div className="text-error mt-1.5 text-xs">{error}</div>}
         </div>
-        {error && !editing && <div className="text-error mt-2 text-xs">{error}</div>}
+
+        {/* List custom models */}
+        {customModels.map((model) => {
+          const isModelEditing =
+            editing?.provider === model.provider && editing?.originalModelId === model.modelId;
+          return (
+            <ModelRow
+              key={model.fullId}
+              provider={model.provider}
+              modelId={model.modelId}
+              fullId={model.fullId}
+              isCustom={true}
+              isDefault={defaultModel === model.fullId}
+              isEditing={isModelEditing}
+              editValue={isModelEditing ? editing.newModelId : undefined}
+              editError={isModelEditing ? error : undefined}
+              saving={saving}
+              hasActiveEdit={editing !== null}
+              onSetDefault={() => setDefaultModel(model.fullId)}
+              onStartEdit={() => handleStartEdit(model.provider, model.modelId)}
+              onSaveEdit={() => void handleSaveEdit()}
+              onCancelEdit={handleCancelEdit}
+              onEditChange={(value) =>
+                setEditing((prev) => (prev ? { ...prev, newModelId: value } : null))
+              }
+              onRemove={() => void handleRemoveModel(model.provider, model.modelId)}
+            />
+          );
+        })}
       </div>
 
-      {/* List of custom models */}
-      {allModels.length > 0 ? (
-        <div className="space-y-2">
-          <div className="text-muted text-xs font-medium tracking-wide uppercase">
-            Custom Models
-          </div>
-          {allModels.map(({ provider, modelId }) => {
-            const isEditing =
-              editing?.provider === provider && editing?.originalModelId === modelId;
-
-            return (
-              <div
-                key={`${provider}-${modelId}`}
-                className="border-border-medium bg-background-secondary flex items-center justify-between rounded-md border px-4 py-2"
-              >
-                <div className="flex min-w-0 flex-1 items-center gap-3">
-                  <span className="text-muted shrink-0 text-xs">
-                    {PROVIDER_DISPLAY_NAMES[provider as keyof typeof PROVIDER_DISPLAY_NAMES] ??
-                      provider}
-                  </span>
-                  {isEditing ? (
-                    <div className="flex min-w-0 flex-1 flex-col gap-1">
-                      <input
-                        type="text"
-                        value={editing.newModelId}
-                        onChange={(e) =>
-                          setEditing((prev) =>
-                            prev ? { ...prev, newModelId: e.target.value } : null
-                          )
-                        }
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") void handleSaveEdit();
-                          if (e.key === "Escape") handleCancelEdit();
-                        }}
-                        className="bg-modal-bg border-border-medium focus:border-accent min-w-0 flex-1 rounded border px-2 py-1 font-mono text-xs focus:outline-none"
-                        autoFocus
-                      />
-                      {error && <div className="text-error text-xs">{error}</div>}
-                    </div>
-                  ) : (
-                    <span className="text-foreground min-w-0 truncate font-mono text-sm">
-                      {modelId}
-                    </span>
-                  )}
-                </div>
-                <div className="ml-2 flex shrink-0 items-center gap-1">
-                  {isEditing ? (
-                    <>
-                      <button
-                        type="button"
-                        onClick={() => void handleSaveEdit()}
-                        disabled={saving}
-                        className="text-accent hover:text-accent-dark p-1 transition-colors"
-                        title="Save changes (Enter)"
-                      >
-                        <Check className="h-4 w-4" />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={handleCancelEdit}
-                        disabled={saving}
-                        className="text-muted hover:text-foreground p-1 transition-colors"
-                        title="Cancel (Escape)"
-                      >
-                        <X className="h-4 w-4" />
-                      </button>
-                    </>
-                  ) : (
-                    <>
-                      <button
-                        type="button"
-                        onClick={() => handleStartEdit(provider, modelId)}
-                        disabled={saving || editing !== null}
-                        className="text-muted hover:text-foreground p-1 transition-colors disabled:opacity-50"
-                        title="Edit model"
-                      >
-                        <Pencil className="h-4 w-4" />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => void handleRemoveModel(provider, modelId)}
-                        disabled={saving || editing !== null}
-                        className="text-muted hover:text-error p-1 transition-colors disabled:opacity-50"
-                        title="Remove model"
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </button>
-                    </>
-                  )}
-                </div>
-              </div>
-            );
-          })}
+      {/* Built-in Models */}
+      <div className="space-y-1.5">
+        <div className="text-muted text-xs font-medium tracking-wide uppercase">
+          Built-in Models
         </div>
-      ) : (
-        <div className="text-muted py-8 text-center text-sm">
-          No custom models configured. Add one above to get started.
-        </div>
-      )}
+        {builtInModels.map((model) => (
+          <ModelRow
+            key={model.fullId}
+            provider={model.provider}
+            modelId={model.modelId}
+            fullId={model.fullId}
+            aliases={model.aliases}
+            isCustom={false}
+            isDefault={defaultModel === model.fullId}
+            isEditing={false}
+            onSetDefault={() => setDefaultModel(model.fullId)}
+          />
+        ))}
+      </div>
     </div>
   );
 }
