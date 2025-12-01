@@ -338,26 +338,40 @@ export class IpcMain {
         options.trunkBranch ?? (await detectDefaultTrunkBranch(projectPath, branches)) ?? "main";
 
       // 3. Create workspace
-      const finalRuntimeConfig: RuntimeConfig = options.runtimeConfig ?? {
-        type: "local",
+      // Default to worktree runtime for new workspaces
+      let finalRuntimeConfig: RuntimeConfig = options.runtimeConfig ?? {
+        type: "worktree",
         srcBaseDir: this.config.srcDir,
       };
 
       const workspaceId = this.config.generateStableId();
 
       let runtime;
-      let resolvedSrcBaseDir: string;
       try {
-        runtime = createRuntime(finalRuntimeConfig);
-        resolvedSrcBaseDir = await runtime.resolvePath(finalRuntimeConfig.srcBaseDir);
+        // Handle different runtime types
+        const isLocalProjectDir =
+          finalRuntimeConfig.type === "local" &&
+          !("srcBaseDir" in finalRuntimeConfig && finalRuntimeConfig.srcBaseDir);
 
-        if (resolvedSrcBaseDir !== finalRuntimeConfig.srcBaseDir) {
-          const resolvedRuntimeConfig: RuntimeConfig = {
-            ...finalRuntimeConfig,
-            srcBaseDir: resolvedSrcBaseDir,
-          };
-          runtime = createRuntime(resolvedRuntimeConfig);
-          finalRuntimeConfig.srcBaseDir = resolvedSrcBaseDir;
+        if (isLocalProjectDir) {
+          // Local project-dir runtime: use projectPath directly
+          runtime = createRuntime(finalRuntimeConfig, { projectPath });
+        } else {
+          // Worktree, legacy local with srcBaseDir, or SSH runtime
+          runtime = createRuntime(finalRuntimeConfig);
+
+          // Resolve srcBaseDir for worktree/SSH runtimes
+          if ("srcBaseDir" in finalRuntimeConfig && finalRuntimeConfig.srcBaseDir) {
+            const resolvedSrcBaseDir = await runtime.resolvePath(finalRuntimeConfig.srcBaseDir);
+            if (resolvedSrcBaseDir !== finalRuntimeConfig.srcBaseDir) {
+              const resolvedConfig: RuntimeConfig = {
+                ...finalRuntimeConfig,
+                srcBaseDir: resolvedSrcBaseDir,
+              };
+              finalRuntimeConfig = resolvedConfig;
+              runtime = createRuntime(finalRuntimeConfig);
+            }
+          }
         }
       } catch (error) {
         const errorMsg = error instanceof Error ? error.message : String(error);
@@ -643,31 +657,39 @@ export class IpcMain {
         // Generate stable workspace ID (stored in config, not used for directory name)
         const workspaceId = this.config.generateStableId();
 
-        // Create runtime for workspace creation (defaults to local with srcDir as base)
-        const finalRuntimeConfig: RuntimeConfig = runtimeConfig ?? {
-          type: "local",
+        // Create runtime for workspace creation (defaults to worktree with srcDir as base)
+        let finalRuntimeConfig: RuntimeConfig = runtimeConfig ?? {
+          type: "worktree",
           srcBaseDir: this.config.srcDir,
         };
 
-        // Create temporary runtime to resolve srcBaseDir path
-        // This allows tilde paths to work for both local and SSH runtimes
+        // Create runtime instance based on config type
         let runtime;
-        let resolvedSrcBaseDir: string;
         try {
-          runtime = createRuntime(finalRuntimeConfig);
+          // Handle different runtime types
+          const isLocalProjectDir =
+            finalRuntimeConfig.type === "local" &&
+            !("srcBaseDir" in finalRuntimeConfig && finalRuntimeConfig.srcBaseDir);
 
-          // Resolve srcBaseDir to absolute path (expanding tildes, etc.)
-          resolvedSrcBaseDir = await runtime.resolvePath(finalRuntimeConfig.srcBaseDir);
+          if (isLocalProjectDir) {
+            // Local project-dir runtime: use projectPath directly
+            runtime = createRuntime(finalRuntimeConfig, { projectPath });
+          } else {
+            // Worktree, legacy local with srcBaseDir, or SSH runtime
+            runtime = createRuntime(finalRuntimeConfig);
 
-          // If path was resolved to something different, recreate runtime with resolved path
-          if (resolvedSrcBaseDir !== finalRuntimeConfig.srcBaseDir) {
-            const resolvedRuntimeConfig: RuntimeConfig = {
-              ...finalRuntimeConfig,
-              srcBaseDir: resolvedSrcBaseDir,
-            };
-            runtime = createRuntime(resolvedRuntimeConfig);
-            // Update finalRuntimeConfig to store resolved path in config
-            finalRuntimeConfig.srcBaseDir = resolvedSrcBaseDir;
+            // Resolve srcBaseDir for worktree/SSH runtimes
+            if ("srcBaseDir" in finalRuntimeConfig && finalRuntimeConfig.srcBaseDir) {
+              const resolvedSrcBaseDir = await runtime.resolvePath(finalRuntimeConfig.srcBaseDir);
+              if (resolvedSrcBaseDir !== finalRuntimeConfig.srcBaseDir) {
+                const resolvedConfig: RuntimeConfig = {
+                  ...finalRuntimeConfig,
+                  srcBaseDir: resolvedSrcBaseDir,
+                };
+                finalRuntimeConfig = resolvedConfig;
+                runtime = createRuntime(finalRuntimeConfig);
+              }
+            }
           }
         } catch (error) {
           const errorMsg = error instanceof Error ? error.message : String(error);
@@ -841,7 +863,8 @@ export class IpcMain {
           // Create runtime instance for this workspace
           // For local runtimes, workdir should be srcDir, not the individual workspace path
           const runtime = createRuntime(
-            oldMetadata.runtimeConfig ?? { type: "local", srcBaseDir: this.config.srcDir }
+            oldMetadata.runtimeConfig ?? { type: "local", srcBaseDir: this.config.srcDir },
+            { projectPath }
           );
 
           // Delegate rename to runtime (handles both local and SSH)
@@ -930,7 +953,7 @@ export class IpcMain {
             type: "local",
             srcBaseDir: this.config.srcDir,
           };
-          const runtime = createRuntime(sourceRuntimeConfig);
+          const runtime = createRuntime(sourceRuntimeConfig, { projectPath: foundProjectPath });
 
           // Generate stable workspace ID for the new workspace
           const newWorkspaceId = this.config.generateStableId();
@@ -1381,7 +1404,7 @@ export class IpcMain {
             type: "local" as const,
             srcBaseDir: this.config.srcDir,
           };
-          const runtime = createRuntime(runtimeConfig);
+          const runtime = createRuntime(runtimeConfig, { projectPath: metadata.projectPath });
           const workspacePath = runtime.getWorkspacePath(metadata.projectPath, metadata.name);
 
           // Create bash tool with workspace's cwd and secrets
@@ -1489,12 +1512,13 @@ export class IpcMain {
         log.info(`Workspace ${workspaceId} metadata exists but not found in config`);
         return { success: true }; // Consider it already removed
       }
-      const { projectPath, workspacePath } = workspace;
+      const { projectPath, workspacePath: _workspacePath } = workspace;
 
       // Create runtime instance for this workspace
       // For local runtimes, workdir should be srcDir, not the individual workspace path
       const runtime = createRuntime(
-        metadata.runtimeConfig ?? { type: "local", srcBaseDir: this.config.srcDir }
+        metadata.runtimeConfig ?? { type: "local", srcBaseDir: this.config.srcDir },
+        { projectPath }
       );
 
       // Delegate deletion to runtime - it handles all path computation, existence checks, and pruning
@@ -1514,12 +1538,14 @@ export class IpcMain {
       // Delete workspace metadata (fire and forget)
       void this.extensionMetadata.deleteWorkspace(workspaceId);
 
-      // Update config to remove the workspace from all projects
+      // Update config to remove the workspace by ID
+      // NOTE: Filter by ID, not path. For local project-dir runtimes, multiple workspaces
+      // share the same path (the project directory), so filtering by path would delete them all.
       const projectsConfig = this.config.loadConfigOrDefault();
       let configUpdated = false;
       for (const [_projectPath, projectConfig] of projectsConfig.projects.entries()) {
         const initialCount = projectConfig.workspaces.length;
-        projectConfig.workspaces = projectConfig.workspaces.filter((w) => w.path !== workspacePath);
+        projectConfig.workspaces = projectConfig.workspaces.filter((w) => w.id !== workspaceId);
         if (projectConfig.workspaces.length < initialCount) {
           configUpdated = true;
         }
@@ -1862,7 +1888,8 @@ export class IpcMain {
 
         // Create runtime for this workspace (default to local if not specified)
         const runtime = createRuntime(
-          workspaceMetadata.runtimeConfig ?? { type: "local", srcBaseDir: this.config.srcDir }
+          workspaceMetadata.runtimeConfig ?? { type: "local", srcBaseDir: this.config.srcDir },
+          { projectPath: workspaceMetadata.projectPath }
         );
 
         // Compute workspace path
