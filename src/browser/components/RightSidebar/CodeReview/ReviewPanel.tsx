@@ -45,6 +45,8 @@ interface ReviewPanelProps {
   onReviewNote?: (note: string) => void;
   /** Trigger to focus panel (increment to trigger) */
   focusTrigger?: number;
+  /** Workspace is still being created (git operations in progress) */
+  isCreating?: boolean;
 }
 
 interface ReviewSearchState {
@@ -120,6 +122,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
   workspacePath,
   onReviewNote,
   focusTrigger,
+  isCreating = false,
 }) => {
   const { api } = useAPI();
   const panelRef = useRef<HTMLDivElement>(null);
@@ -191,7 +194,8 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
 
   // Load file tree - when workspace, diffBase, or refreshTrigger changes
   useEffect(() => {
-    if (!api) return;
+    // Skip data loading while workspace is being created
+    if (!api || isCreating) return;
     let cancelled = false;
 
     const loadFileTree = async () => {
@@ -239,11 +243,13 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     filters.diffBase,
     filters.includeUncommitted,
     refreshTrigger,
+    isCreating,
   ]);
 
   // Load diff hunks - when workspace, diffBase, selected path, or refreshTrigger changes
   useEffect(() => {
-    if (!api) return;
+    // Skip data loading while workspace is being created
+    if (!api || isCreating) return;
     let cancelled = false;
 
     const loadDiff = async () => {
@@ -333,6 +339,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     filters.includeUncommitted,
     selectedFilePath,
     refreshTrigger,
+    isCreating,
   ]);
 
   // Persist diffBase when it changes
@@ -617,6 +624,17 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, []);
+
+  // Show loading state while workspace is being created
+  if (isCreating) {
+    return (
+      <div className="flex h-full flex-col items-center justify-center p-8 text-center">
+        <div className="mb-4 text-2xl">⏳</div>
+        <p className="text-secondary text-sm">Setting up workspace...</p>
+        <p className="text-secondary mt-1 text-xs">Review will be available once ready</p>
+      </div>
+    );
+  }
 
   return (
     <div

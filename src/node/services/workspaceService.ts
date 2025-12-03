@@ -14,14 +14,16 @@ import type { InitStateManager } from "@/node/services/initStateManager";
 import type { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import { listLocalBranches, detectDefaultTrunkBranch } from "@/node/git";
 import { createRuntime, IncompatibleRuntimeError } from "@/node/runtime/runtimeFactory";
-import { generateWorkspaceName } from "./workspaceTitleGenerator";
+import { generateWorkspaceName, generatePlaceholderName } from "./workspaceTitleGenerator";
 import { validateWorkspaceName } from "@/common/utils/validation/workspaceValidation";
+import { formatSendMessageError } from "@/node/services/utils/sendMessageError";
 
 import type {
   SendMessageOptions,
   DeleteMessage,
   ImagePart,
   WorkspaceChatMessage,
+  StreamErrorMessage,
 } from "@/common/orpc/types";
 import type { SendMessageError } from "@/common/types/errors";
 import type {
@@ -80,6 +82,8 @@ export class WorkspaceService extends EventEmitter {
     string,
     { chat: () => void; metadata: () => void }
   >();
+  // Tracks workspaces currently being renamed to prevent streaming during rename
+  private readonly renamingWorkspaces = new Set<string>();
 
   constructor(
     private readonly config: Config,
@@ -403,7 +407,7 @@ export class WorkspaceService extends EventEmitter {
     }
   }
 
-  async createForFirstMessage(
+  createForFirstMessage(
     message: string,
     projectPath: string,
     options: SendMessageOptions & {
@@ -411,45 +415,88 @@ export class WorkspaceService extends EventEmitter {
       runtimeConfig?: RuntimeConfig;
       trunkBranch?: string;
     } = { model: "claude-3-5-sonnet-20241022" }
-  ): Promise<
+  ):
     | { success: true; workspaceId: string; metadata: FrontendWorkspaceMetadata }
-    | { success: false; error: string }
-  > {
+    | { success: false; error: string } {
+    // Generate placeholder name and ID immediately (non-blocking)
+    const placeholderName = generatePlaceholderName(message);
+    const workspaceId = this.config.generateStableId();
+    const projectName = projectPath.split("/").pop() ?? projectPath.split("\\").pop() ?? "unknown";
+
+    // Use provided runtime config or default to worktree
+    const runtimeConfig: RuntimeConfig = options.runtimeConfig ?? {
+      type: "worktree",
+      srcBaseDir: this.config.srcDir,
+    };
+
+    // Compute preliminary workspace path (may be refined after srcBaseDir resolution)
+    const srcBaseDir = getSrcBaseDir(runtimeConfig) ?? this.config.srcDir;
+    const preliminaryWorkspacePath = path.join(srcBaseDir, projectName, placeholderName);
+
+    // Create preliminary metadata with "creating" status for immediate UI response
+    const preliminaryMetadata: FrontendWorkspaceMetadata = {
+      id: workspaceId,
+      name: placeholderName,
+      projectName,
+      projectPath,
+      createdAt: new Date().toISOString(),
+      namedWorkspacePath: preliminaryWorkspacePath,
+      runtimeConfig,
+      status: "creating",
+    };
+
+    // Create session and emit metadata immediately so frontend can switch
+    const session = this.getOrCreateSession(workspaceId);
+    session.emitMetadata(preliminaryMetadata);
+
+    log.debug("Emitted preliminary workspace metadata", { workspaceId, placeholderName });
+
+    // Kick off background workspace creation (git operations, config save, etc.)
+    void this.completeWorkspaceCreation(
+      workspaceId,
+      message,
+      projectPath,
+      placeholderName,
+      runtimeConfig,
+      options
+    );
+
+    // Return immediately with preliminary metadata
+    return {
+      success: true,
+      workspaceId,
+      metadata: preliminaryMetadata,
+    };
+  }
+
+  /**
+   * Completes workspace creation in the background after preliminary metadata is emitted.
+   * Handles git operations, config persistence, and kicks off message sending.
+   */
+  private async completeWorkspaceCreation(
+    workspaceId: string,
+    message: string,
+    projectPath: string,
+    placeholderName: string,
+    runtimeConfig: RuntimeConfig,
+    options: SendMessageOptions & {
+      imageParts?: Array<{ url: string; mediaType: string }>;
+      runtimeConfig?: RuntimeConfig;
+      trunkBranch?: string;
+    }
+  ): Promise<void> {
+    const session = this.sessions.get(workspaceId);
+    if (!session) {
+      log.error("Session not found for workspace creation", { workspaceId });
+      return;
+    }
+
     try {
-      const branchNameResult = await generateWorkspaceName(message, options.model, this.aiService);
-      if (!branchNameResult.success) {
-        const err = branchNameResult.error;
-        const errorMessage =
-          "message" in err
-            ? err.message
-            : err.type === "api_key_not_found"
-              ? `API key not found for ${err.provider}`
-              : err.type === "provider_not_supported"
-                ? `Provider not supported: ${err.provider}`
-                : "raw" in err
-                  ? err.raw
-                  : "Unknown error";
-        return { success: false, error: errorMessage };
-      }
-      const branchName = branchNameResult.data;
-      log.debug("Generated workspace name", { branchName });
-
-      const branches = await listLocalBranches(projectPath);
-      const recommendedTrunk =
-        options.trunkBranch ?? (await detectDefaultTrunkBranch(projectPath, branches)) ?? "main";
-
-      // Default to worktree runtime for backward compatibility
-      let finalRuntimeConfig: RuntimeConfig = options.runtimeConfig ?? {
-        type: "worktree",
-        srcBaseDir: this.config.srcDir,
-      };
-
-      const workspaceId = this.config.generateStableId();
-
+      // Resolve runtime config (may involve path resolution for SSH)
+      let finalRuntimeConfig = runtimeConfig;
       let runtime;
       try {
         runtime = createRuntime(finalRuntimeConfig, { projectPath });
-        // Resolve srcBaseDir path if the config has one
         const srcBaseDir = getSrcBaseDir(finalRuntimeConfig);
         if (srcBaseDir) {
           const resolvedSrcBaseDir = await runtime.resolvePath(srcBaseDir);
@@ -463,15 +510,21 @@ export class WorkspaceService extends EventEmitter {
         }
       } catch (error) {
         const errorMsg = error instanceof Error ? error.message : String(error);
-        return { success: false, error: errorMsg };
+        log.error("Failed to create runtime for workspace", { workspaceId, error: errorMsg });
+        session.emitMetadata(null); // Remove the "creating" workspace
+        return;
       }
 
-      const session = this.getOrCreateSession(workspaceId);
+      // Detect trunk branch (git operation)
+      const branches = await listLocalBranches(projectPath);
+      const recommendedTrunk =
+        options.trunkBranch ?? (await detectDefaultTrunkBranch(projectPath, branches)) ?? "main";
+
       this.initStateManager.startInit(workspaceId, projectPath);
       const initLogger = this.createInitLogger(workspaceId);
 
       // Create workspace with automatic collision retry
-      let finalBranchName = branchName;
+      let finalBranchName = placeholderName;
       let createResult: { success: boolean; workspacePath?: string; error?: string };
 
       for (let attempt = 0; attempt <= MAX_WORKSPACE_NAME_COLLISION_RETRIES; attempt++) {
@@ -485,38 +538,32 @@ export class WorkspaceService extends EventEmitter {
 
         if (createResult.success) break;
 
-        // If collision and not last attempt, retry with suffix
         if (
           isWorkspaceNameCollision(createResult.error) &&
           attempt < MAX_WORKSPACE_NAME_COLLISION_RETRIES
         ) {
           log.debug(`Workspace name collision for "${finalBranchName}", retrying with suffix`);
-          finalBranchName = appendCollisionSuffix(branchName);
+          finalBranchName = appendCollisionSuffix(placeholderName);
           continue;
         }
         break;
       }
 
       if (!createResult!.success || !createResult!.workspacePath) {
-        return { success: false, error: createResult!.error ?? "Failed to create workspace" };
+        log.error("Failed to create workspace", {
+          workspaceId,
+          error: createResult!.error,
+        });
+        session.emitMetadata(null); // Remove the "creating" workspace
+        return;
       }
 
       const projectName =
         projectPath.split("/").pop() ?? projectPath.split("\\").pop() ?? "unknown";
-
-      // Compute namedWorkspacePath
       const namedWorkspacePath = runtime.getWorkspacePath(projectPath, finalBranchName);
+      const createdAt = new Date().toISOString();
 
-      const metadata: FrontendWorkspaceMetadata = {
-        id: workspaceId,
-        name: finalBranchName,
-        projectName,
-        projectPath,
-        createdAt: new Date().toISOString(),
-        namedWorkspacePath,
-        runtimeConfig: finalRuntimeConfig,
-      };
-
+      // Save to config
       await this.config.editConfig((config) => {
         let projectConfig = config.projects.get(projectPath);
         if (!projectConfig) {
@@ -527,21 +574,27 @@ export class WorkspaceService extends EventEmitter {
           path: createResult!.workspacePath!,
           id: workspaceId,
           name: finalBranchName,
-          createdAt: metadata.createdAt,
+          createdAt,
           runtimeConfig: finalRuntimeConfig,
         });
         return config;
       });
 
-      const allMetadata = await this.config.getAllWorkspaceMetadata();
-      const completeMetadata = allMetadata.find((m) => m.id === workspaceId);
+      // Emit final metadata (without "creating" status)
+      const finalMetadata: FrontendWorkspaceMetadata = {
+        id: workspaceId,
+        name: finalBranchName,
+        projectName,
+        projectPath,
+        createdAt,
+        namedWorkspacePath,
+        runtimeConfig: finalRuntimeConfig,
+      };
+      session.emitMetadata(finalMetadata);
 
-      if (!completeMetadata) {
-        return { success: false, error: "Failed to retrieve workspace metadata" };
-      }
+      log.debug("Workspace creation completed", { workspaceId, finalBranchName });
 
-      session.emitMetadata(completeMetadata);
-
+      // Start workspace initialization in background
       void runtime
         .initWorkspace({
           projectPath,
@@ -557,18 +610,169 @@ export class WorkspaceService extends EventEmitter {
           initLogger.logComplete(-1);
         });
 
-      void session.sendMessage(message, options);
+      // Send the first message, surfacing errors to the chat UI
+      void session.sendMessage(message, options).then((result) => {
+        if (!result.success) {
+          log.error("sendMessage failed during workspace creation", {
+            workspaceId,
+            errorType: result.error.type,
+            error: result.error,
+          });
+          const { message: errorMessage, errorType } = formatSendMessageError(result.error);
+          const streamError: StreamErrorMessage = {
+            type: "stream-error",
+            messageId: `error-${Date.now()}`,
+            error: errorMessage,
+            errorType,
+          };
+          session.emitChatEvent(streamError);
+        }
+      });
 
-      return {
-        success: true,
-        workspaceId,
-        metadata: completeMetadata,
-      };
+      // Generate AI name asynchronously and rename if successful
+      void this.generateAndApplyAIName(workspaceId, message, finalBranchName, options.model);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      log.error("Unexpected error in createWorkspaceForFirstMessage:", error);
-      return { success: false, error: `Failed to create workspace: ${errorMessage}` };
+      log.error("Unexpected error in workspace creation", { workspaceId, error: errorMessage });
+      session.emitMetadata(null); // Remove the "creating" workspace
     }
+  }
+
+  /**
+   * Asynchronously generates an AI workspace name and renames the workspace if successful.
+   * This runs in the background after workspace creation to avoid blocking the UX.
+   *
+   * The method:
+   * 1. Generates the AI name (can run while stream is active)
+   * 2. Waits for any active stream to complete (rename is blocked during streaming)
+   * 3. Attempts to rename the workspace
+   */
+  private async generateAndApplyAIName(
+    workspaceId: string,
+    message: string,
+    currentName: string,
+    model: string
+  ): Promise<void> {
+    try {
+      log.debug("Starting async AI name generation", { workspaceId, currentName });
+
+      const branchNameResult = await generateWorkspaceName(message, model, this.aiService);
+
+      if (!branchNameResult.success) {
+        // AI name generation failed - keep the placeholder name
+        const err = branchNameResult.error;
+        const errorMessage =
+          "message" in err
+            ? err.message
+            : err.type === "api_key_not_found"
+              ? `API key not found for ${err.provider}`
+              : err.type === "provider_not_supported"
+                ? `Provider not supported: ${err.provider}`
+                : "raw" in err
+                  ? err.raw
+                  : "Unknown error";
+        log.info("AI name generation failed, keeping placeholder name", {
+          workspaceId,
+          currentName,
+          error: errorMessage,
+        });
+        return;
+      }
+
+      const aiGeneratedName = branchNameResult.data;
+      log.debug("AI generated workspace name", { workspaceId, aiGeneratedName, currentName });
+
+      // Only rename if the AI name is different from current name
+      if (aiGeneratedName === currentName) {
+        log.debug("AI name matches placeholder, no rename needed", { workspaceId });
+        return;
+      }
+
+      // Wait for the stream to complete before renaming (rename is blocked during streaming)
+      await this.waitForStreamComplete(workspaceId);
+
+      // Mark workspace as renaming to block new streams during the rename operation
+      this.renamingWorkspaces.add(workspaceId);
+      try {
+        // Attempt to rename with collision retry (same logic as workspace creation)
+        let finalName = aiGeneratedName;
+        for (let attempt = 0; attempt <= MAX_WORKSPACE_NAME_COLLISION_RETRIES; attempt++) {
+          const renameResult = await this.rename(workspaceId, finalName);
+
+          if (renameResult.success) {
+            log.info("Successfully renamed workspace to AI-generated name", {
+              workspaceId,
+              oldName: currentName,
+              newName: finalName,
+            });
+            return;
+          }
+
+          // If collision and not last attempt, retry with suffix
+          if (
+            renameResult.error?.includes("already exists") &&
+            attempt < MAX_WORKSPACE_NAME_COLLISION_RETRIES
+          ) {
+            log.debug(`Workspace name collision for "${finalName}", retrying with suffix`);
+            finalName = appendCollisionSuffix(aiGeneratedName);
+            continue;
+          }
+
+          // Non-collision error or out of retries - keep placeholder name
+          log.info("Failed to rename workspace to AI-generated name", {
+            workspaceId,
+            aiGeneratedName: finalName,
+            error: renameResult.error,
+          });
+          return;
+        }
+      } finally {
+        // Always clear renaming flag, even on error
+        this.renamingWorkspaces.delete(workspaceId);
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      log.error("Unexpected error in async AI name generation", {
+        workspaceId,
+        error: errorMessage,
+      });
+    }
+  }
+
+  /**
+   * Waits for an active stream on the workspace to complete.
+   * Returns immediately if no stream is active.
+   */
+  private waitForStreamComplete(workspaceId: string): Promise<void> {
+    // If not currently streaming, resolve immediately
+    if (!this.aiService.isStreaming(workspaceId)) {
+      return Promise.resolve();
+    }
+
+    log.debug("Waiting for stream to complete before rename", { workspaceId });
+
+    return new Promise((resolve) => {
+      // Create handler that checks for this workspace's stream end
+      const handler = (event: StreamEndEvent | StreamAbortEvent) => {
+        if (event.workspaceId === workspaceId) {
+          this.aiService.off("stream-end", handler);
+          this.aiService.off("stream-abort", handler);
+          log.debug("Stream completed, proceeding with rename", { workspaceId });
+          resolve();
+        }
+      };
+
+      // Listen for both normal completion and abort
+      this.aiService.on("stream-end", handler);
+      this.aiService.on("stream-abort", handler);
+
+      // Safety check: if stream already ended between the isStreaming check and subscribing
+      if (!this.aiService.isStreaming(workspaceId)) {
+        this.aiService.off("stream-end", handler);
+        this.aiService.off("stream-abort", handler);
+        resolve();
+      }
+    });
   }
 
   async remove(workspaceId: string, force = false): Promise<Result<void>> {
@@ -697,6 +901,9 @@ export class WorkspaceService extends EventEmitter {
         return Err(validation.error ?? "Invalid workspace name");
       }
 
+      // Mark workspace as renaming to block new streams during the rename operation
+      this.renamingWorkspaces.add(workspaceId);
+
       const metadataResult = await this.aiService.getWorkspaceMetadata(workspaceId);
       if (!metadataResult.success) {
         return Err(`Failed to get workspace metadata: ${metadataResult.error}`);
@@ -764,6 +971,9 @@ export class WorkspaceService extends EventEmitter {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return Err(`Failed to rename workspace: ${message}`);
+    } finally {
+      // Always clear renaming flag, even on error
+      this.renamingWorkspaces.delete(workspaceId);
     }
   }
 
@@ -897,7 +1107,7 @@ export class WorkspaceService extends EventEmitter {
         messagePreview: message.substring(0, 50),
       });
 
-      return await this.createForFirstMessage(message, options.projectPath, options);
+      return this.createForFirstMessage(message, options.projectPath, options);
     }
 
     log.debug("sendMessage handler: Received", {
@@ -908,6 +1118,15 @@ export class WorkspaceService extends EventEmitter {
     });
 
     try {
+      // Block streaming while workspace is being renamed to prevent path conflicts
+      if (this.renamingWorkspaces.has(workspaceId)) {
+        log.debug("sendMessage blocked: workspace is being renamed", { workspaceId });
+        return Err({
+          type: "unknown",
+          raw: "Workspace is being renamed. Please wait and try again.",
+        });
+      }
+
       const session = this.getOrCreateSession(workspaceId);
       void this.updateRecencyTimestamp(workspaceId);
 
@@ -950,6 +1169,15 @@ export class WorkspaceService extends EventEmitter {
     options: SendMessageOptions | undefined = { model: "claude-3-5-sonnet-latest" }
   ): Promise<Result<void, SendMessageError>> {
     try {
+      // Block streaming while workspace is being renamed to prevent path conflicts
+      if (this.renamingWorkspaces.has(workspaceId)) {
+        log.debug("resumeStream blocked: workspace is being renamed", { workspaceId });
+        return Err({
+          type: "unknown",
+          raw: "Workspace is being renamed. Please wait and try again.",
+        });
+      }
+
       const session = this.getOrCreateSession(workspaceId);
       const result = await session.resumeStream(options);
       if (!result.success) {

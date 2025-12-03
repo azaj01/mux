@@ -576,6 +576,9 @@ function AppInner() {
                   currentMetadata?.name ??
                   selectedWorkspace.namedWorkspacePath?.split("/").pop() ??
                   selectedWorkspace.workspaceId;
+                // Use live metadata path (updates on rename) with fallback to initial path
+                const workspacePath =
+                  currentMetadata?.namedWorkspacePath ?? selectedWorkspace.namedWorkspacePath ?? "";
                 return (
                   <ErrorBoundary
                     workspaceInfo={`${selectedWorkspace.projectName}/${workspaceName}`}
@@ -586,9 +589,10 @@ function AppInner() {
                       projectPath={selectedWorkspace.projectPath}
                       projectName={selectedWorkspace.projectName}
                       branch={workspaceName}
-                      namedWorkspacePath={selectedWorkspace.namedWorkspacePath ?? ""}
+                      namedWorkspacePath={workspacePath}
                       runtimeConfig={currentMetadata?.runtimeConfig}
                       incompatibleRuntime={currentMetadata?.incompatibleRuntime}
+                      status={currentMetadata?.status}
                     />
                   </ErrorBoundary>
                 );
@@ -609,7 +613,13 @@ function AppInner() {
                           onProviderConfig={handleProviderConfig}
                           onReady={handleCreationChatReady}
                           onWorkspaceCreated={(metadata) => {
-                            // Add to workspace metadata map
+                            // IMPORTANT: Add workspace to store FIRST (synchronous) to ensure
+                            // the store knows about it before React processes the state updates.
+                            // This prevents race conditions where the UI tries to access the
+                            // workspace before the store has created its aggregator.
+                            workspaceStore.addWorkspace(metadata);
+
+                            // Add to workspace metadata map (triggers React state update)
                             setWorkspaceMetadata((prev) =>
                               new Map(prev).set(metadata.id, metadata)
                             );
