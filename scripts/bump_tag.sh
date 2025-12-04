@@ -29,14 +29,23 @@ fi
 
 echo "Bumping version: $CURRENT_VERSION -> $NEW_VERSION"
 
+# Rollback function to restore original state on failure
+rollback() {
+  echo "Error: Rolling back changes..." >&2
+  jq --arg v "$CURRENT_VERSION" '.version = $v' package.json >package.json.tmp
+  mv package.json.tmp package.json
+  git reset HEAD -- package.json 2>/dev/null || true
+  exit 1
+}
+
 # Update package.json
 jq --arg v "$NEW_VERSION" '.version = $v' package.json >package.json.tmp
 mv package.json.tmp package.json
 
-# Commit and tag
-git add package.json
-git commit -m "release: v${NEW_VERSION}"
-git tag "v${NEW_VERSION}"
+# Commit and tag (rollback on failure)
+git add package.json || rollback
+git commit -m "release: v${NEW_VERSION}" || rollback
+git tag "v${NEW_VERSION}" || rollback
 
 echo "Created tag v${NEW_VERSION}"
 echo "Run 'git push && git push --tags' to publish"
