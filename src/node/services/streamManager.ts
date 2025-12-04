@@ -334,22 +334,34 @@ export class StreamManager extends EventEmitter {
   private async getStreamMetadata(
     streamInfo: WorkspaceStreamInfo,
     timeoutMs = 1000
-  ): Promise<{ usage?: LanguageModelV2Usage; duration: number }> {
-    let usage = undefined;
-    try {
-      // Race usage retrieval against timeout to prevent hanging on abort
-      // CRITICAL: Use totalUsage (sum of all steps) not usage (last step only)
-      // For multi-step tool calls, usage would severely undercount actual token consumption
-      usage = await Promise.race([
-        streamInfo.streamResult.totalUsage,
+  ): Promise<{
+    totalUsage?: LanguageModelV2Usage;
+    contextUsage?: LanguageModelV2Usage;
+    contextProviderMetadata?: Record<string, unknown>;
+    duration: number;
+  }> {
+    // Helper: wrap promise with independent timeout + error handling
+    // Each promise resolves independently - one failure doesn't mask others
+    const withTimeout = <T>(promise: Promise<T>): Promise<T | undefined> =>
+      Promise.race([
+        promise,
         new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), timeoutMs)),
-      ]);
-    } catch (error) {
-      log.debug("Could not retrieve usage:", error);
-    }
+      ]).catch(() => undefined);
+
+    // Fetch all metadata in parallel with independent timeouts
+    // - totalUsage: sum of all steps (for cost calculation)
+    // - contextUsage: last step only (for context window display)
+    // - contextProviderMetadata: last step (for context window cache display)
+    const [totalUsage, contextUsage, contextProviderMetadata] = await Promise.all([
+      withTimeout(streamInfo.streamResult.totalUsage),
+      withTimeout(streamInfo.streamResult.usage),
+      withTimeout(streamInfo.streamResult.providerMetadata),
+    ]);
 
     return {
-      usage,
+      totalUsage,
+      contextUsage,
+      contextProviderMetadata,
       duration: Date.now() - streamInfo.startTime,
     };
   }
@@ -1045,16 +1057,19 @@ export class StreamManager extends EventEmitter {
 
       // Check if stream completed successfully
       if (!streamInfo.abortController.signal.aborted) {
-        // Get usage, duration, and provider metadata from stream result
-        // CRITICAL: Use totalUsage (via getStreamMetadata) and aggregated providerMetadata
-        // to correctly account for all steps in multi-tool-call conversations
-        const { usage, duration } = await this.getStreamMetadata(streamInfo);
+        // Get all metadata from stream result in one call
+        // - totalUsage: sum of all steps (for cost calculation)
+        // - contextUsage: last step only (for context window display)
+        // - contextProviderMetadata: last step (for context window cache tokens)
+        // Falls back to tracked values from finish-step if streamResult fails/times out
+        const streamMeta = await this.getStreamMetadata(streamInfo);
+        const totalUsage = streamMeta.totalUsage;
+        const contextUsage = streamMeta.contextUsage ?? streamInfo.lastStepUsage;
+        const contextProviderMetadata =
+          streamMeta.contextProviderMetadata ?? streamInfo.lastStepProviderMetadata;
+        const duration = streamMeta.duration;
+        // Aggregated provider metadata across all steps (for cost calculation with cache tokens)
         const providerMetadata = await this.getAggregatedProviderMetadata(streamInfo);
-
-        // For context window display, use last step's usage (inputTokens = current context size)
-        // This is stored in streamInfo during finish-step handling
-        const contextUsage = streamInfo.lastStepUsage;
-        const contextProviderMetadata = streamInfo.lastStepProviderMetadata;
 
         // Emit stream end event with parts preserved in temporal order
         const streamEndEvent: StreamEndEvent = {
@@ -1064,7 +1079,7 @@ export class StreamManager extends EventEmitter {
           metadata: {
             ...streamInfo.initialMetadata, // AIService-provided metadata (systemMessageTokens, etc)
             model: streamInfo.model,
-            usage, // Total across all steps (for cost calculation)
+            usage: totalUsage, // Total across all steps (for cost calculation)
             contextUsage, // Last step only (for context window display)
             providerMetadata, // Aggregated (for cost calculation)
             contextProviderMetadata, // Last step (for context window display)
