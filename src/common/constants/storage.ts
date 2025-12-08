@@ -224,6 +224,15 @@ export function getReviewSearchStateKey(workspaceId: string): string {
 }
 
 /**
+ * Get the localStorage key for reviews per workspace
+ * Stores: ReviewsState (reviews created from diff viewer - pending, attached, or checked)
+ * Format: "reviews:{workspaceId}"
+ */
+export function getReviewsKey(workspaceId: string): string {
+  return `reviews:${workspaceId}`;
+}
+
+/**
  * Get the localStorage key for auto-compaction enabled preference per workspace
  * Format: "autoCompaction:enabled:{workspaceId}"
  */
@@ -253,6 +262,7 @@ const PERSISTENT_WORKSPACE_KEY_FUNCTIONS: Array<(workspaceId: string) => string>
   getReviewExpandStateKey,
   getFileTreeExpandStateKey,
   getReviewSearchStateKey,
+  getReviewsKey,
   getAutoCompactionEnabledKey,
   getStatusUrlKey,
   // Note: getAutoCompactionThresholdKey is per-model, not per-workspace

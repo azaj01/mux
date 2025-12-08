@@ -13,7 +13,10 @@ import {
   EXPANDED_PROJECTS_KEY,
   getInputKey,
   getModelKey,
+  getReviewsKey,
 } from "@/common/constants/storage";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import type { Review, ReviewsState } from "@/common/types/review";
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
 import {
   createWorkspace,
@@ -55,6 +58,38 @@ export function setWorkspaceModel(workspaceId: string, model: string): void {
 /** Expand projects in the sidebar */
 export function expandProjects(projectPaths: string[]): void {
   localStorage.setItem(EXPANDED_PROJECTS_KEY, JSON.stringify(projectPaths));
+}
+
+/** Set reviews for a workspace */
+export function setReviews(workspaceId: string, reviews: Review[]): void {
+  const state: ReviewsState = {
+    workspaceId,
+    reviews: Object.fromEntries(reviews.map((r) => [r.id, r])),
+    lastUpdated: Date.now(),
+  };
+  updatePersistedState(getReviewsKey(workspaceId), state);
+}
+
+/** Create a sample review for stories */
+export function createReview(
+  id: string,
+  filePath: string,
+  lineRange: string,
+  note: string,
+  status: "pending" | "checked" = "pending"
+): Review {
+  return {
+    id,
+    data: {
+      filePath,
+      lineRange,
+      selectedCode: "// sample code",
+      userNote: note,
+    },
+    status,
+    createdAt: Date.now() - Math.random() * 3600000, // Random time in last hour
+    statusChangedAt: status === "checked" ? Date.now() : undefined,
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

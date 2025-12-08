@@ -63,6 +63,7 @@ import {
 
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { MuxFrontendMetadata } from "@/common/types/message";
+import { prepareUserMessageForSend } from "@/common/types/message";
 import { MODEL_ABBREVIATION_EXAMPLES } from "@/common/constants/knownModels";
 import { useTelemetry } from "@/browser/hooks/useTelemetry";
 
@@ -75,6 +76,7 @@ import { useTutorial } from "@/browser/contexts/TutorialContext";
 import { useVoiceInput } from "@/browser/hooks/useVoiceInput";
 import { VoiceInputButton } from "./VoiceInputButton";
 import { RecordingOverlay } from "./RecordingOverlay";
+import { ReviewBlockFromData } from "../shared/ReviewBlock";
 
 type TokenCountReader = () => number;
 
@@ -140,11 +142,14 @@ export const ChatInput: React.FC<ChatInputProps> = (props) => {
 
   const [input, setInput] = usePersistedState(storageKeys.inputKey, "", { listener: true });
   const [isSending, setIsSending] = useState(false);
+  const [hideReviewsDuringSend, setHideReviewsDuringSend] = useState(false);
   const [showCommandSuggestions, setShowCommandSuggestions] = useState(false);
   const [commandSuggestions, setCommandSuggestions] = useState<SlashSuggestion[]>([]);
   const [providerNames, setProviderNames] = useState<string[]>([]);
   const [toast, setToast] = useState<Toast | null>(null);
   const [imageAttachments, setImageAttachments] = useState<ImageAttachment[]>([]);
+  // Attached reviews come from parent via props (persisted in pendingReviews state)
+  const attachedReviews = variant === "workspace" ? (props.attachedReviews ?? []) : [];
   const handleToastDismiss = useCallback(() => {
     setToast(null);
   }, []);
@@ -152,7 +157,7 @@ export const ChatInput: React.FC<ChatInputProps> = (props) => {
   const modelSelectorRef = useRef<ModelSelectorRef>(null);
 
   // Draft state combines text input and image attachments
-  // Use these helpers to avoid accidentally losing images when modifying text
+  // Reviews are managed separately via props (persisted in pendingReviews state)
   interface DraftState {
     text: string;
     images: ImageAttachment[];
@@ -236,7 +241,8 @@ export const ChatInput: React.FC<ChatInputProps> = (props) => {
   );
   const hasTypedText = input.trim().length > 0;
   const hasImages = imageAttachments.length > 0;
-  const canSend = (hasTypedText || hasImages) && !disabled && !isSending;
+  const hasReviews = attachedReviews.length > 0;
+  const canSend = (hasTypedText || hasImages || hasReviews) && !disabled && !isSending;
   // Setter for model - updates localStorage directly so useSendMessageOptions picks it up
   const setPreferredModel = useCallback(
     (model: string) => {
@@ -946,8 +952,8 @@ export const ChatInput: React.FC<ChatInputProps> = (props) => {
       }
       setIsSending(true);
 
-      // Save current state for restoration on error
-      const previousImageAttachments = [...imageAttachments];
+      // Save current draft state for restoration on error
+      const preSendDraft = getDraft();
 
       // Auto-compaction check (workspace variant only)
       // Check if we should auto-compact before sending this message
@@ -962,9 +968,18 @@ export const ChatInput: React.FC<ChatInputProps> = (props) => {
           mediaType: img.mediaType,
         }));
 
+        // Prepare reviews data for the continue message (orthogonal to compaction)
+        // Review.data is already ReviewNoteData shape
+        const reviewsData =
+          attachedReviews.length > 0 ? attachedReviews.map((r) => r.data) : undefined;
+
+        // Capture review IDs for marking as checked on success
+        const sentReviewIds = attachedReviews.map((r) => r.id);
+
         // Clear input immediately for responsive UX
         setInput("");
         setImageAttachments([]);
+        setHideReviewsDuringSend(true);
 
         try {
           const result = await executeCompaction({
@@ -974,14 +989,14 @@ export const ChatInput: React.FC<ChatInputProps> = (props) => {
               text: messageText,
               imageParts,
               model: sendMessageOptions.model,
+              reviews: reviewsData,
             },
             sendMessageOptions,
           });
 
           if (!result.success) {
             // Restore on error
-            setInput(messageText);
-            setImageAttachments(previousImageAttachments);
+            setDraft(preSendDraft);
             setToast({
               id: Date.now().toString(),
               type: "error",
@@ -989,6 +1004,10 @@ export const ChatInput: React.FC<ChatInputProps> = (props) => {
               message: result.error ?? "Failed to start auto-compaction",
             });
           } else {
+            // Mark reviews as checked on success
+            if (sentReviewIds.length > 0) {
+              props.onCheckReviews?.(sentReviewIds);
+            }
             setToast({
               id: Date.now().toString(),
               type: "success",
@@ -998,8 +1017,7 @@ export const ChatInput: React.FC<ChatInputProps> = (props) => {
           }
         } catch (error) {
           // Restore on unexpected error
-          setInput(messageText);
-          setImageAttachments(previousImageAttachments);
+          setDraft(preSendDraft);
           setToast({
             id: Date.now().toString(),
             type: "error",
@@ -1009,6 +1027,7 @@ export const ChatInput: React.FC<ChatInputProps> = (props) => {
           });
         } finally {
           setIsSending(false);
+          setHideReviewsDuringSend(false);
         }
 
         return; // Skip normal send
@@ -1072,10 +1091,25 @@ export const ChatInput: React.FC<ChatInputProps> = (props) => {
           }
         }
 
-        // Clear input and images immediately for responsive UI
-        // These will be restored if the send operation fails
+        // Process reviews into message text and metadata using shared utility
+        // Review.data is already ReviewNoteData shape
+        const reviewsData =
+          attachedReviews.length > 0 ? attachedReviews.map((r) => r.data) : undefined;
+        const { finalText: finalMessageText, metadata: reviewMetadata } = prepareUserMessageForSend(
+          { text: actualMessageText, reviews: reviewsData },
+          muxMetadata
+        );
+        muxMetadata = reviewMetadata;
+
+        // Capture review IDs before clearing (for marking as checked on success)
+        const sentReviewIds = attachedReviews.map((r) => r.id);
+
+        // Clear input, images, and hide reviews immediately for responsive UI
+        // Text/images are restored if send fails; reviews remain "attached" in state
+        // so they'll reappear naturally on failure (we only call onCheckReviews on success)
         setInput("");
         setImageAttachments([]);
+        setHideReviewsDuringSend(true);
         // Clear inline height style - VimTextArea's useLayoutEffect will handle sizing
         if (inputRef.current) {
           inputRef.current.style.height = "";
@@ -1083,7 +1117,7 @@ export const ChatInput: React.FC<ChatInputProps> = (props) => {
 
         const result = await api.workspace.sendMessage({
           workspaceId: props.workspaceId,
-          message: actualMessageText,
+          message: finalMessageText,
           options: {
             ...sendMessageOptions,
             ...compactionOptions,
@@ -1098,19 +1132,23 @@ export const ChatInput: React.FC<ChatInputProps> = (props) => {
           console.error("Failed to send message:", result.error);
           // Show error using enhanced toast
           setToast(createErrorToast(result.error));
-          // Restore input and images on error so user can try again
-          setInput(messageText);
-          setImageAttachments(previousImageAttachments);
+          // Restore draft on error so user can try again
+          setDraft(preSendDraft);
         } else {
           // Track telemetry for successful message send
           telemetry.messageSent(
             props.workspaceId,
             sendMessageOptions.model,
             mode,
-            actualMessageText.length,
+            finalMessageText.length,
             runtimeType,
             sendMessageOptions.thinkingLevel ?? "off"
           );
+
+          // Mark attached reviews as completed (checked)
+          if (sentReviewIds.length > 0) {
+            props.onCheckReviews?.(sentReviewIds);
+          }
 
           // Exit editing mode if we were editing
           if (editingMessage && props.onCancelEdit) {
@@ -1127,10 +1165,11 @@ export const ChatInput: React.FC<ChatInputProps> = (props) => {
             raw: error instanceof Error ? error.message : "Failed to send message",
           })
         );
-        setInput(messageText);
-        setImageAttachments(previousImageAttachments);
+        // Restore draft on error
+        setDraft(preSendDraft);
       } finally {
         setIsSending(false);
+        setHideReviewsDuringSend(false);
       }
     } finally {
       // Always restore focus at the end
@@ -1306,6 +1345,27 @@ export const ChatInput: React.FC<ChatInputProps> = (props) => {
           {/* Workspace toast */}
           {variant === "workspace" && (
             <ChatInputToast toast={toast} onDismiss={handleToastDismiss} />
+          )}
+
+          {/* Attached reviews preview - show styled blocks with remove/edit buttons */}
+          {/* Hide during send to avoid duplicate display with the sent message */}
+          {variant === "workspace" && attachedReviews.length > 0 && !hideReviewsDuringSend && (
+            <div className="border-border max-h-[50vh] space-y-2 overflow-y-auto border-b px-1.5 py-1.5">
+              {attachedReviews.map((review) => (
+                <ReviewBlockFromData
+                  key={review.id}
+                  data={review.data}
+                  onRemove={
+                    props.onDetachReview ? () => props.onDetachReview!(review.id) : undefined
+                  }
+                  onEditComment={
+                    props.onUpdateReviewNote
+                      ? (newNote) => props.onUpdateReviewNote!(review.id, newNote)
+                      : undefined
+                  }
+                />
+              ))}
+            </div>
           )}
 
           {/* Command suggestions - workspace only */}

@@ -2,6 +2,7 @@ import type { ImagePart } from "@/common/orpc/types";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { TelemetryRuntimeType } from "@/common/telemetry/payload";
 import type { AutoCompactionCheckResult } from "@/browser/utils/compaction/autoCompactionCheck";
+import type { Review } from "@/common/types/review";
 
 export interface ChatInputAPI {
   focus: () => void;
@@ -29,6 +30,14 @@ export interface ChatInputWorkspaceVariant {
   disabled?: boolean;
   onReady?: (api: ChatInputAPI) => void;
   autoCompactionCheck?: AutoCompactionCheckResult; // Computed in parent (AIView) to avoid duplicate calculation
+  /** Reviews currently attached to chat (from useReviews hook) */
+  attachedReviews?: Review[];
+  /** Detach a review from chat input (sets status to pending) */
+  onDetachReview?: (reviewId: string) => void;
+  /** Mark reviews as checked after sending */
+  onCheckReviews?: (reviewIds: string[]) => void;
+  /** Update a review's comment/note */
+  onUpdateReviewNote?: (reviewId: string, newNote: string) => void;
 }
 
 // Creation variant: simplified for first message / workspace creation

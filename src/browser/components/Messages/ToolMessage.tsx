@@ -35,11 +35,14 @@ import type {
   WebFetchToolArgs,
   WebFetchToolResult,
 } from "@/common/types/tools";
+import type { ReviewNoteData } from "@/common/types/review";
 
 interface ToolMessageProps {
   message: DisplayedMessage & { type: "tool" };
   className?: string;
   workspaceId?: string;
+  /** Handler for adding review notes from inline diffs */
+  onReviewNote?: (data: ReviewNoteData) => void;
 }
 
 // Type guards using Zod schemas for single source of truth
@@ -108,7 +111,12 @@ function isBashBackgroundTerminateTool(
   return TOOL_DEFINITIONS.bash_background_terminate.schema.safeParse(args).success;
 }
 
-export const ToolMessage: React.FC<ToolMessageProps> = ({ message, className, workspaceId }) => {
+export const ToolMessage: React.FC<ToolMessageProps> = ({
+  message,
+  className,
+  workspaceId,
+  onReviewNote,
+}) => {
   // Route to specialized components based on tool name
   if (isBashTool(message.toolName, message.args)) {
     return (
@@ -143,6 +151,7 @@ export const ToolMessage: React.FC<ToolMessageProps> = ({ message, className, wo
           args={message.args}
           result={message.result as FileEditReplaceStringToolResult | undefined}
           status={message.status}
+          onReviewNote={onReviewNote}
         />
       </div>
     );
@@ -156,6 +165,7 @@ export const ToolMessage: React.FC<ToolMessageProps> = ({ message, className, wo
           args={message.args}
           result={message.result as FileEditInsertToolResult | undefined}
           status={message.status}
+          onReviewNote={onReviewNote}
         />
       </div>
     );
@@ -169,6 +179,7 @@ export const ToolMessage: React.FC<ToolMessageProps> = ({ message, className, wo
           args={message.args}
           result={message.result as FileEditReplaceLinesToolResult | undefined}
           status={message.status}
+          onReviewNote={onReviewNote}
         />
       </div>
     );

@@ -50,6 +50,9 @@ import { useAutoCompactionSettings } from "../hooks/useAutoCompactionSettings";
 import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
 import { useForceCompaction } from "@/browser/hooks/useForceCompaction";
 import { useAPI } from "@/browser/contexts/API";
+import { useReviews } from "@/browser/hooks/useReviews";
+import { ReviewsBanner } from "./ReviewsBanner";
+import type { ReviewNoteData } from "@/common/types/review";
 
 interface AIViewProps {
   workspaceId: string;
@@ -105,6 +108,9 @@ const AIViewInner: React.FC<AIViewProps> = ({
   const workspaceState = useWorkspaceState(workspaceId);
   const aggregator = useWorkspaceAggregator(workspaceId);
   const workspaceUsage = useWorkspaceUsage(workspaceId);
+
+  // Reviews state
+  const reviews = useReviews(workspaceId);
   const { options } = useProviderOptions();
   const use1M = options.anthropic?.use1MContext ?? false;
   // Get pending model for auto-compaction settings (threshold is per-model)
@@ -213,10 +219,14 @@ const AIViewInner: React.FC<AIViewProps> = ({
     chatInputAPI.current = api;
   }, []);
 
-  // Handler for review notes from Code Review tab
-  const handleReviewNote = useCallback((note: string) => {
-    chatInputAPI.current?.appendText(note);
-  }, []);
+  // Handler for review notes from Code Review tab - adds review (starts attached)
+  const handleReviewNote = useCallback(
+    (data: ReviewNoteData) => {
+      reviews.addReview(data);
+      // New reviews start with status "attached" so they appear in chat input immediately
+    },
+    [reviews]
+  );
 
   // Handler for manual compaction from CompactionWarning click
   const handleCompactClick = useCallback(() => {
@@ -532,6 +542,7 @@ const AIViewInner: React.FC<AIViewProps> = ({
                             onEditUserMessage={handleEditUserMessage}
                             workspaceId={workspaceId}
                             isCompacting={isCompacting}
+                            onReviewNote={handleReviewNote}
                           />
                         </div>
                         {isAtCutoff && (
@@ -606,6 +617,7 @@ const AIViewInner: React.FC<AIViewProps> = ({
             onCompactClick={handleCompactClick}
           />
         )}
+        <ReviewsBanner workspaceId={workspaceId} />
         <ChatInput
           variant="workspace"
           workspaceId={workspaceId}
@@ -621,6 +633,10 @@ const AIViewInner: React.FC<AIViewProps> = ({
           canInterrupt={canInterrupt}
           onReady={handleChatInputReady}
           autoCompactionCheck={autoCompactionResult}
+          attachedReviews={reviews.attachedReviews}
+          onDetachReview={reviews.detachReview}
+          onCheckReviews={(ids) => ids.forEach((id) => reviews.checkReview(id))}
+          onUpdateReviewNote={reviews.updateReviewNote}
         />
       </div>
 
