@@ -42,7 +42,7 @@ import {
   getSlashCommandSuggestions,
   type SlashSuggestion,
 } from "@/browser/utils/slashCommands/suggestions";
-import { TooltipWrapper, Tooltip, HelpIndicator } from "../Tooltip";
+import { Tooltip, TooltipTrigger, TooltipContent, HelpIndicator } from "../ui/tooltip";
 import { ModeSelector } from "../ModeSelector";
 import {
   matchesKeybind,
@@ -1398,9 +1398,11 @@ export const ChatInput: React.FC<ChatInputProps> = (props) => {
                   defaultModel={defaultModel}
                   onSetDefaultModel={setDefaultModel}
                 />
-                <TooltipWrapper inline>
-                  <HelpIndicator>?</HelpIndicator>
-                  <Tooltip className="tooltip" align="left" width="wide">
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <HelpIndicator>?</HelpIndicator>
+                  </TooltipTrigger>
+                  <TooltipContent align="start" className="max-w-80 whitespace-normal">
                     <strong>Click to edit</strong> or use{" "}
                     {formatKeybind(KEYBINDS.OPEN_MODEL_SELECTOR)}
                     <br />
@@ -1418,8 +1420,8 @@ export const ChatInput: React.FC<ChatInputProps> = (props) => {
                     <code>/model provider:model-name</code>
                     <br />
                     (e.g., <code>/model anthropic:claude-sonnet-4-5</code>)
-                  </Tooltip>
-                </TooltipWrapper>
+                  </TooltipContent>
+                </Tooltip>
               </div>
 
               {/* Thinking Slider - slider hidden on narrow containers, label always clickable */}
@@ -1457,25 +1459,27 @@ export const ChatInput: React.FC<ChatInputProps> = (props) => {
                 data-tutorial="mode-selector"
               >
                 <ModeSelector mode={mode} onChange={setMode} />
-                <TooltipWrapper inline>
-                  <button
-                    type="button"
-                    onClick={() => void handleSend()}
-                    disabled={!canSend}
-                    aria-label="Send message"
-                    className={cn(
-                      "inline-flex items-center gap-1 rounded-sm border border-border-light px-1.5 py-0.5 text-[11px] font-medium text-white transition-colors duration-200 disabled:opacity-50",
-                      mode === "plan"
-                        ? "bg-plan-mode hover:bg-plan-mode-hover disabled:hover:bg-plan-mode"
-                        : "bg-exec-mode hover:bg-exec-mode-hover disabled:hover:bg-exec-mode"
-                    )}
-                  >
-                    <SendHorizontal className="h-3.5 w-3.5" strokeWidth={2.5} />
-                  </button>
-                  <Tooltip className="tooltip" align="center">
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      type="button"
+                      onClick={() => void handleSend()}
+                      disabled={!canSend}
+                      aria-label="Send message"
+                      className={cn(
+                        "inline-flex items-center gap-1 rounded-sm border border-border-light px-1.5 py-0.5 text-[11px] font-medium text-white transition-colors duration-200 disabled:opacity-50",
+                        mode === "plan"
+                          ? "bg-plan-mode hover:bg-plan-mode-hover disabled:hover:bg-plan-mode"
+                          : "bg-exec-mode hover:bg-exec-mode-hover disabled:hover:bg-exec-mode"
+                      )}
+                    >
+                      <SendHorizontal className="h-3.5 w-3.5" strokeWidth={2.5} />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent align="center">
                     Send message ({formatKeybind(KEYBINDS.SEND_MESSAGE)})
-                  </Tooltip>
-                </TooltipWrapper>
+                  </TooltipContent>
+                </Tooltip>
               </div>
             </div>
 
