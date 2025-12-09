@@ -6,97 +6,11 @@ import type { MCPServerMap, MCPTestResult } from "@/common/types/mcp";
 import type { Runtime } from "@/node/runtime/Runtime";
 import type { MCPConfigService } from "@/node/services/mcpConfigService";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
+import { transformMCPResult, type MCPCallToolResult } from "@/node/services/mcpResultTransform";
 
 const TEST_TIMEOUT_MS = 10_000;
 const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 const IDLE_CHECK_INTERVAL_MS = 60 * 1000; // Check every minute
-
-/**
- * MCP CallToolResult content types (from @ai-sdk/mcp)
- */
-interface MCPTextContent {
-  type: "text";
-  text: string;
-}
-
-interface MCPImageContent {
-  type: "image";
-  data: string; // base64
-  mimeType: string;
-}
-
-interface MCPResourceContent {
-  type: "resource";
-  resource: { uri: string; text?: string; blob?: string; mimeType?: string };
-}
-
-type MCPContent = MCPTextContent | MCPImageContent | MCPResourceContent;
-
-interface MCPCallToolResult {
-  content?: MCPContent[];
-  isError?: boolean;
-  toolResult?: unknown;
-}
-
-/**
- * AI SDK LanguageModelV2ToolResultOutput content types
- */
-type AISDKContentPart =
-  | { type: "text"; text: string }
-  | { type: "media"; data: string; mediaType: string };
-
-/**
- * Transform MCP tool result to AI SDK format.
- * Converts MCP's "image" content type to AI SDK's "media" type.
- */
-function transformMCPResult(result: MCPCallToolResult): unknown {
-  // If it's an error or has toolResult, pass through as-is
-  if (result.isError || result.toolResult !== undefined) {
-    return result;
-  }
-
-  // If no content array, pass through
-  if (!result.content || !Array.isArray(result.content)) {
-    return result;
-  }
-
-  // Check if any content is an image
-  const hasImage = result.content.some((c) => c.type === "image");
-  if (!hasImage) {
-    return result;
-  }
-
-  // Debug: log what we received from MCP
-  log.debug("[MCP] transformMCPResult input", {
-    contentTypes: result.content.map((c) => c.type),
-    imageItems: result.content
-      .filter((c): c is MCPImageContent => c.type === "image")
-      .map((c) => ({ type: c.type, mimeType: c.mimeType, dataLen: c.data?.length })),
-  });
-
-  // Transform to AI SDK content format
-  const transformedContent: AISDKContentPart[] = result.content.map((item) => {
-    if (item.type === "text") {
-      return { type: "text" as const, text: item.text };
-    }
-    if (item.type === "image") {
-      const imageItem = item;
-      // Ensure mediaType is present - default to image/png if missing
-      const mediaType = imageItem.mimeType || "image/png";
-      log.debug("[MCP] Transforming image content", { mimeType: imageItem.mimeType, mediaType });
-      return { type: "media" as const, data: imageItem.data, mediaType };
-    }
-    // For resource type, convert to text representation
-    if (item.type === "resource") {
-      const text = item.resource.text ?? item.resource.uri;
-      return { type: "text" as const, text };
-    }
-    // Fallback: stringify unknown content
-    return { type: "text" as const, text: JSON.stringify(item) };
-  });
-
-  return { type: "content", value: transformedContent };
-}
 
 /**
  * Wrap MCP tools to transform their results to AI SDK format.
@@ -186,12 +100,30 @@ interface WorkspaceServers {
   lastActivity: number;
 }
 
+export interface MCPServerManagerOptions {
+  /** Inline servers to use (merged with config file servers by default) */
+  inlineServers?: MCPServerMap;
+  /** If true, ignore config file servers and use only inline servers */
+  ignoreConfigFile?: boolean;
+}
+
 export class MCPServerManager {
   private readonly workspaceServers = new Map<string, WorkspaceServers>();
   private readonly idleCheckInterval: ReturnType<typeof setInterval>;
+  private inlineServers: MCPServerMap = {};
+  private ignoreConfigFile = false;
 
-  constructor(private readonly configService: MCPConfigService) {
+  constructor(
+    private readonly configService: MCPConfigService,
+    options?: MCPServerManagerOptions
+  ) {
     this.idleCheckInterval = setInterval(() => this.cleanupIdleServers(), IDLE_CHECK_INTERVAL_MS);
+    if (options?.inlineServers) {
+      this.inlineServers = options.inlineServers;
+    }
+    if (options?.ignoreConfigFile) {
+      this.ignoreConfigFile = options.ignoreConfigFile;
+    }
   }
 
   /**
@@ -217,11 +149,23 @@ export class MCPServerManager {
   }
 
   /**
+   * Get merged servers: config file servers (unless ignoreConfigFile) + inline servers.
+   * Inline servers take precedence over config file servers with the same name.
+   */
+  private async getMergedServers(projectPath: string): Promise<MCPServerMap> {
+    const configServers = this.ignoreConfigFile
+      ? {}
+      : await this.configService.listServers(projectPath);
+    // Inline servers override config file servers
+    return { ...configServers, ...this.inlineServers };
+  }
+
+  /**
    * List configured MCP servers for a project (name -> command).
    * Used to show server info in the system prompt.
    */
   async listServers(projectPath: string): Promise<MCPServerMap> {
-    return this.configService.listServers(projectPath);
+    return this.getMergedServers(projectPath);
   }
 
   async getToolsForWorkspace(options: {
@@ -231,7 +175,7 @@ export class MCPServerManager {
     workspacePath: string;
   }): Promise<Record<string, Tool>> {
     const { workspaceId, projectPath, runtime, workspacePath } = options;
-    const servers = await this.configService.listServers(projectPath);
+    const servers = await this.getMergedServers(projectPath);
     const signature = JSON.stringify(servers);
     const serverNames = Object.keys(servers);
 
