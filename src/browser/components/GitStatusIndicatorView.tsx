@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import type { GitStatus } from "@/common/types/workspace";
 import type { GitCommit, GitBranchHeader } from "@/common/utils/git/parseGitLog";
 import { cn } from "@/common/lib/utils";
+import { ToggleGroup, ToggleGroupItem } from "./ui/toggle-group";
 
 // Helper for indicator colors
 const getIndicatorColor = (branch: number): string => {
@@ -18,9 +19,30 @@ const getIndicatorColor = (branch: number): string => {
   }
 };
 
+function formatCountAbbrev(count: number): string {
+  const abs = Math.abs(count);
+
+  if (abs < 1000) {
+    return String(count);
+  }
+
+  if (abs < 1_000_000) {
+    const raw = (abs / 1000).toFixed(1);
+    const normalized = raw.endsWith(".0") ? raw.slice(0, -2) : raw;
+    return `${count < 0 ? "-" : ""}${normalized}k`;
+  }
+
+  const raw = (abs / 1_000_000).toFixed(1);
+  const normalized = raw.endsWith(".0") ? raw.slice(0, -2) : raw;
+  return `${count < 0 ? "-" : ""}${normalized}m`;
+}
+
+export type GitStatusIndicatorMode = "divergence" | "line-delta";
+
 export interface GitStatusIndicatorViewProps {
   gitStatus: GitStatus | null;
   tooltipPosition?: "right" | "bottom";
+  mode: GitStatusIndicatorMode;
   // Tooltip data
   branchHeaders: GitBranchHeader[] | null;
   commits: GitCommit[] | null;
@@ -34,6 +56,7 @@ export interface GitStatusIndicatorViewProps {
   onMouseLeave: () => void;
   onTooltipMouseEnter: () => void;
   onTooltipMouseLeave: () => void;
+  onModeChange: (nextMode: GitStatusIndicatorMode) => void;
   onContainerRef: (el: HTMLSpanElement | null) => void;
   /** When true, shows blue pulsing styling to indicate agent is working */
   isWorking?: boolean;
@@ -47,6 +70,7 @@ export interface GitStatusIndicatorViewProps {
 export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
   gitStatus,
   tooltipPosition = "right",
+  mode,
   branchHeaders,
   commits,
   dirtyFiles,
@@ -58,6 +82,7 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
   onMouseLeave,
   onTooltipMouseEnter,
   onTooltipMouseLeave,
+  onModeChange,
   onContainerRef,
   isWorking = false,
 }) => {
@@ -71,8 +96,16 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
     );
   }
 
+  const outgoingLines = gitStatus.outgoingAdditions + gitStatus.outgoingDeletions;
+
   // Render empty placeholder when nothing to show (prevents layout shift)
-  if (gitStatus.ahead === 0 && gitStatus.behind === 0 && !gitStatus.dirty) {
+  // In line-delta mode, also show if behind so users can toggle to divergence view
+  const isEmpty =
+    mode === "divergence"
+      ? gitStatus.ahead === 0 && gitStatus.behind === 0 && !gitStatus.dirty
+      : outgoingLines === 0 && !gitStatus.dirty && gitStatus.behind === 0;
+
+  if (isEmpty) {
     return (
       <span
         className="text-accent relative mr-1.5 flex items-center gap-1 font-mono text-[11px]"
@@ -186,6 +219,16 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
     );
   };
 
+  const outgoingHasDelta = gitStatus.outgoingAdditions > 0 || gitStatus.outgoingDeletions > 0;
+  const hasCommitDivergence = gitStatus.ahead > 0 || gitStatus.behind > 0;
+
+  // Dynamic color based on working state
+  // Idle: muted/grayscale, Working: original accent colors
+  const statusColor = isWorking ? "text-accent" : "text-muted";
+  const dirtyColor = isWorking ? "text-git-dirty" : "text-muted";
+  const additionsColor = isWorking ? "text-success-light" : "text-muted";
+  const deletionsColor = isWorking ? "text-warning-light" : "text-muted";
+
   // Render tooltip via portal to bypass overflow constraints
   const tooltipElement = (
     <div
@@ -201,14 +244,60 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
       onMouseEnter={onTooltipMouseEnter}
       onMouseLeave={onTooltipMouseLeave}
     >
+      <div className="border-separator-light mb-2 flex flex-col gap-1 border-b pb-2">
+        <div className="flex items-center gap-2">
+          <span className="text-muted-light">Divergence:</span>
+          <ToggleGroup
+            type="single"
+            value={mode}
+            onValueChange={(value) => {
+              if (!value) return;
+              onModeChange(value as GitStatusIndicatorMode);
+            }}
+            aria-label="Git status indicator mode"
+            size="sm"
+          >
+            <ToggleGroupItem value="line-delta" aria-label="Show line delta" size="sm">
+              Lines
+            </ToggleGroupItem>
+            <ToggleGroupItem value="divergence" aria-label="Show commit divergence" size="sm">
+              Commits
+            </ToggleGroupItem>
+          </ToggleGroup>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px]">
+          <span className="text-muted-light">Overview:</span>
+          {outgoingHasDelta ? (
+            <span className="flex items-center gap-2">
+              {gitStatus.outgoingAdditions > 0 && (
+                <span className={cn("font-normal", additionsColor)}>
+                  +{formatCountAbbrev(gitStatus.outgoingAdditions)}
+                </span>
+              )}
+              {gitStatus.outgoingDeletions > 0 && (
+                <span className={cn("font-normal", deletionsColor)}>
+                  -{formatCountAbbrev(gitStatus.outgoingDeletions)}
+                </span>
+              )}
+            </span>
+          ) : (
+            <span className="text-muted">Lines: 0</span>
+          )}
+          {hasCommitDivergence ? (
+            <span className="text-muted">
+              Commits: {formatCountAbbrev(gitStatus.ahead)} ahead ·{" "}
+              {formatCountAbbrev(gitStatus.behind)} behind
+            </span>
+          ) : (
+            <span className="text-muted">Commits: 0</span>
+          )}
+        </div>
+      </div>
+
       {renderTooltipContent()}
     </div>
   );
-
-  // Dynamic color based on working state
-  // Idle: muted/grayscale, Working: original accent colors
-  const statusColor = isWorking ? "text-accent" : "text-muted";
-  const dirtyColor = isWorking ? "text-git-dirty" : "text-muted";
 
   return (
     <>
@@ -221,11 +310,44 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
           statusColor
         )}
       >
-        {gitStatus.ahead > 0 && (
-          <span className="flex items-center font-normal">↑{gitStatus.ahead}</span>
-        )}
-        {gitStatus.behind > 0 && (
-          <span className="flex items-center font-normal">↓{gitStatus.behind}</span>
+        {mode === "divergence" ? (
+          <>
+            {gitStatus.ahead > 0 && (
+              <span className="flex items-center font-normal">
+                ↑{formatCountAbbrev(gitStatus.ahead)}
+              </span>
+            )}
+            {gitStatus.behind > 0 && (
+              <span className="flex items-center font-normal">
+                ↓{formatCountAbbrev(gitStatus.behind)}
+              </span>
+            )}
+          </>
+        ) : (
+          <>
+            {outgoingHasDelta ? (
+              <span className="flex items-center gap-2">
+                {gitStatus.outgoingAdditions > 0 && (
+                  <span className={cn("font-normal", additionsColor)}>
+                    +{formatCountAbbrev(gitStatus.outgoingAdditions)}
+                  </span>
+                )}
+                {gitStatus.outgoingDeletions > 0 && (
+                  <span className={cn("font-normal", deletionsColor)}>
+                    -{formatCountAbbrev(gitStatus.outgoingDeletions)}
+                  </span>
+                )}
+              </span>
+            ) : (
+              // No outgoing lines but behind remote - show muted behind indicator
+              // so users know they can hover to toggle to divergence view
+              gitStatus.behind > 0 && (
+                <span className="text-muted flex items-center font-normal">
+                  ↓{formatCountAbbrev(gitStatus.behind)}
+                </span>
+              )
+            )}
+          </>
         )}
         {gitStatus.dirty && (
           <span className={cn("flex items-center leading-none font-normal", dirtyColor)}>*</span>

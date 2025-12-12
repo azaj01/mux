@@ -46,6 +46,7 @@ export class GitStatusStore {
   private fetchCache = new Map<string, FetchState>();
   private client: RouterClient<AppRouter> | null = null;
   private pollInterval: NodeJS.Timeout | null = null;
+  private immediateUpdateQueued = false;
   private workspaceMetadata = new Map<string, FrontendWorkspaceMetadata>();
   private isActive = true;
 
@@ -67,7 +68,22 @@ export class GitStatusStore {
    * Only notified when this workspace's status changes.
    */
   subscribeKey = (workspaceId: string, listener: () => void) => {
-    return this.statuses.subscribeKey(workspaceId, listener);
+    const unsubscribe = this.statuses.subscribeKey(workspaceId, listener);
+
+    // If a component subscribes after we started polling (common on initial load),
+    // kick an immediate update so the UI doesn't wait for the next interval tick.
+    //
+    // We schedule the update as a microtask to avoid doing work in the subscribe
+    // call itself, and to preserve the batching/concurrency limits of updateGitStatus().
+    if (!this.immediateUpdateQueued && this.isActive && this.client) {
+      this.immediateUpdateQueued = true;
+      queueMicrotask(() => {
+        this.immediateUpdateQueued = false;
+        void this.updateGitStatus();
+      });
+    }
+
+    return unsubscribe;
   };
 
   /**
@@ -206,7 +222,15 @@ export class GitStatusStore {
     if (a === null && b === null) return true;
     if (a === null || b === null) return false;
 
-    return a.ahead === b.ahead && a.behind === b.behind && a.dirty === b.dirty;
+    return (
+      a.ahead === b.ahead &&
+      a.behind === b.behind &&
+      a.dirty === b.dirty &&
+      a.outgoingAdditions === b.outgoingAdditions &&
+      a.outgoingDeletions === b.outgoingDeletions &&
+      a.incomingAdditions === b.incomingAdditions &&
+      a.incomingDeletions === b.incomingDeletions
+    );
   }
 
   /**
@@ -254,7 +278,14 @@ export class GitStatusStore {
         return [metadata.id, null];
       }
 
-      const { showBranchOutput, dirtyCount } = parsed;
+      const {
+        showBranchOutput,
+        dirtyCount,
+        outgoingAdditions,
+        outgoingDeletions,
+        incomingAdditions,
+        incomingDeletions,
+      } = parsed;
       const dirty = dirtyCount > 0;
 
       // Parse ahead/behind from show-branch output
@@ -264,7 +295,17 @@ export class GitStatusStore {
         return [metadata.id, null];
       }
 
-      return [metadata.id, { ...parsedStatus, dirty }];
+      return [
+        metadata.id,
+        {
+          ...parsedStatus,
+          dirty,
+          outgoingAdditions,
+          outgoingDeletions,
+          incomingAdditions,
+          incomingDeletions,
+        },
+      ];
     } catch (err) {
       // Silently fail - git status failures shouldn't crash the UI
       console.debug(`[gitStatus] Exception for ${metadata.id}:`, err);
