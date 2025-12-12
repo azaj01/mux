@@ -8,7 +8,21 @@ import { useAPI } from "@/browser/contexts/API";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useGateway } from "@/browser/hooks/useGatewayModels";
 import { Button } from "@/browser/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/browser/components/ui/select";
 import { Switch } from "@/browser/components/ui/switch";
+import {
+  HelpIndicator,
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/browser/components/ui/tooltip";
 
 interface FieldConfig {
   key: string;
@@ -345,6 +359,68 @@ export function ProvidersSection() {
                   );
                 })}
 
+                {/* OpenAI service tier dropdown */}
+                {provider === "openai" && (
+                  <div className="border-border-light border-t pt-3">
+                    <div className="mb-1 flex items-center gap-1">
+                      <label className="text-muted block text-xs">Service tier</label>
+                      <TooltipProvider>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <HelpIndicator aria-label="OpenAI service tier help">?</HelpIndicator>
+                          </TooltipTrigger>
+                          <TooltipContent>
+                            <div className="max-w-[260px]">
+                              <div className="font-semibold">OpenAI service tier</div>
+                              <div className="mt-1">
+                                <span className="font-semibold">auto</span>: standard behavior.
+                              </div>
+                              <div>
+                                <span className="font-semibold">priority</span>: lower latency,
+                                higher cost.
+                              </div>
+                              <div>
+                                <span className="font-semibold">flex</span>: lower cost, higher
+                                latency.
+                              </div>
+                            </div>
+                          </TooltipContent>
+                        </Tooltip>
+                      </TooltipProvider>
+                    </div>
+                    <Select
+                      value={config?.openai?.serviceTier ?? "auto"}
+                      onValueChange={(next) => {
+                        if (!api) return;
+                        if (
+                          next !== "auto" &&
+                          next !== "default" &&
+                          next !== "flex" &&
+                          next !== "priority"
+                        ) {
+                          return;
+                        }
+
+                        updateOptimistically("openai", { serviceTier: next });
+                        void api.providers.setProviderConfig({
+                          provider: "openai",
+                          keyPath: ["serviceTier"],
+                          value: next,
+                        });
+                      }}
+                    >
+                      <SelectTrigger className="w-40">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="auto">auto</SelectItem>
+                        <SelectItem value="default">default</SelectItem>
+                        <SelectItem value="flex">flex</SelectItem>
+                        <SelectItem value="priority">priority</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                )}
                 {/* Gateway enabled toggle - only for mux-gateway when configured */}
                 {provider === "mux-gateway" && gateway.isConfigured && (
                   <div className="border-border-light flex items-center justify-between border-t pt-3">
