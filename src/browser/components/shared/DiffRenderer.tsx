@@ -175,10 +175,31 @@ interface DiffIndicatorProps {
   type: DiffLineType;
   /** Render review button overlay on hover */
   reviewButton?: React.ReactNode;
+  /** When provided, enables drag-to-select behavior in SelectableDiffRenderer */
+  onMouseDown?: React.MouseEventHandler<HTMLSpanElement>;
+  onMouseEnter?: React.MouseEventHandler<HTMLSpanElement>;
+  isInteractive?: boolean;
+  lineIndex?: number;
 }
 
-const DiffIndicator: React.FC<DiffIndicatorProps> = ({ type, reviewButton }) => (
-  <span className="relative inline-block w-4 shrink-0 text-center select-none">
+const DiffIndicator: React.FC<DiffIndicatorProps> = ({
+  type,
+  reviewButton,
+  onMouseDown,
+  onMouseEnter,
+  isInteractive,
+  lineIndex,
+}) => (
+  <span
+    data-diff-indicator={true}
+    data-line-index={lineIndex}
+    className={cn(
+      "relative inline-block w-4 shrink-0 text-center select-none",
+      isInteractive && "cursor-pointer"
+    )}
+    onMouseDown={onMouseDown}
+    onMouseEnter={onMouseEnter}
+  >
     <span
       className={cn("transition-opacity", reviewButton && "group-hover:opacity-0")}
       style={{ color: getIndicatorColor(type) }}
@@ -657,6 +678,23 @@ export const SelectableDiffRenderer = React.memo<SelectableDiffRendererProps>(
     searchConfig,
     enableHighlighting = true,
   }) => {
+    const dragAnchorRef = React.useRef<number | null>(null);
+    const [isDragging, setIsDragging] = React.useState(false);
+
+    React.useEffect(() => {
+      const stopDragging = () => {
+        setIsDragging(false);
+        dragAnchorRef.current = null;
+      };
+
+      window.addEventListener("mouseup", stopDragging);
+      window.addEventListener("blur", stopDragging);
+
+      return () => {
+        window.removeEventListener("mouseup", stopDragging);
+        window.removeEventListener("blur", stopDragging);
+      };
+    }, []);
     const { theme } = useTheme();
     const [selection, setSelection] = React.useState<LineSelection | null>(null);
 
@@ -742,6 +780,34 @@ export const SelectableDiffRenderer = React.memo<SelectableDiffRendererProps>(
       };
     }, [lineData, showLineNumbers]);
 
+    const startDragSelection = React.useCallback(
+      (lineIndex: number, shiftKey: boolean) => {
+        if (!onReviewNote) {
+          return;
+        }
+
+        // Notify parent that this hunk should become active
+        onLineClick?.();
+
+        const anchor = shiftKey && selection ? selection.startIndex : lineIndex;
+        dragAnchorRef.current = anchor;
+        setIsDragging(true);
+        setSelection({ startIndex: anchor, endIndex: lineIndex });
+      },
+      [onLineClick, onReviewNote, selection]
+    );
+
+    const updateDragSelection = React.useCallback(
+      (lineIndex: number) => {
+        if (!isDragging || dragAnchorRef.current === null) {
+          return;
+        }
+
+        setSelection({ startIndex: dragAnchorRef.current, endIndex: lineIndex });
+      },
+      [isDragging]
+    );
+
     const handleCommentButtonClick = (lineIndex: number, shiftKey: boolean) => {
       // Notify parent that this hunk should become active
       onLineClick?.();
@@ -797,6 +863,7 @@ export const SelectableDiffRenderer = React.memo<SelectableDiffRendererProps>(
             <React.Fragment key={displayIndex}>
               <div
                 className={cn(SELECTABLE_DIFF_LINE_CLASS, "flex w-full relative cursor-text group")}
+                data-selected={isSelected ? "true" : "false"}
                 style={{
                   background: isSelected
                     ? "hsl(from var(--color-review-accent) h s l / 0.16)"
@@ -819,9 +886,22 @@ export const SelectableDiffRenderer = React.memo<SelectableDiffRendererProps>(
                 >
                   <DiffIndicator
                     type={lineInfo.type}
+                    lineIndex={displayIndex}
+                    isInteractive={Boolean(onReviewNote)}
+                    onMouseDown={(e) => {
+                      if (!onReviewNote) return;
+                      if (e.button !== 0) return;
+                      e.preventDefault();
+                      e.stopPropagation();
+                      startDragSelection(displayIndex, e.shiftKey);
+                    }}
+                    onMouseEnter={() => {
+                      if (!onReviewNote) return;
+                      updateDragSelection(displayIndex);
+                    }}
                     reviewButton={
                       onReviewNote && (
-                        <Tooltip>
+                        <Tooltip {...(selection || isDragging ? { open: false } : {})}>
                           <TooltipTrigger asChild>
                             <button
                               className="pointer-events-none absolute inset-0 flex items-center justify-center rounded-sm text-[var(--color-review-accent)]/60 opacity-0 transition-opacity group-hover:pointer-events-auto group-hover:opacity-100 hover:text-[var(--color-review-accent)] active:scale-90"
@@ -837,7 +917,7 @@ export const SelectableDiffRenderer = React.memo<SelectableDiffRendererProps>(
                           <TooltipContent side="bottom" align="start">
                             Add review comment
                             <br />
-                            (Shift-click to select range)
+                            (Shift-click or drag to select range)
                           </TooltipContent>
                         </Tooltip>
                       )
