@@ -83,8 +83,6 @@ interface RightSidebarProps {
   workspaceId: string;
   workspacePath: string;
   chatAreaRef: React.RefObject<HTMLDivElement>;
-  /** Callback fired when tab selection changes (used for resize logic in AIView) */
-  onTabChange?: (tab: TabType) => void;
   /** Custom width in pixels (overrides default widths when Review tab is resizable) */
   width?: number;
   /** Drag start handler for resize (Review tab only) */
@@ -101,7 +99,6 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   workspaceId,
   workspacePath,
   chatAreaRef,
-  onTabChange,
   width,
   onStartResize,
   isResizing = false,
@@ -116,11 +113,6 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
 
   // Review stats reported by ReviewPanel
   const [reviewStats, setReviewStats] = React.useState<ReviewStats | null>(null);
-
-  // Notify parent (AIView) of tab changes so it can enable/disable resize functionality
-  React.useEffect(() => {
-    onTabChange?.(selectedTab);
-  }, [selectedTab, onTabChange]);
 
   // Keyboard shortcuts for tab switching
   React.useEffect(() => {
@@ -137,7 +129,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [setSelectedTab, selectedTab]);
+  }, [setSelectedTab]);
 
   const usage = useWorkspaceUsage(workspaceId);
   const { options } = useProviderOptions();
@@ -212,6 +204,18 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       return;
     }
 
+    // If the sidebar is custom-resized (wider than the default Costs width),
+    // auto-collapse based on chatAreaWidth can oscillate between expanded and
+    // collapsed states (because collapsed is 20px but expanded can be much wider),
+    // which looks like a constant flash. In that case, keep it expanded and let
+    // the user resize manually.
+    if (width !== undefined && width > 300) {
+      if (showCollapsed) {
+        setShowCollapsed(false);
+      }
+      return;
+    }
+
     // Normal hysteresis for Costs/Tools tabs
     if (chatAreaWidth <= COLLAPSE_THRESHOLD) {
       setShowCollapsed(true);
@@ -219,7 +223,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       setShowCollapsed(false);
     }
     // Between thresholds: maintain current state (no change)
-  }, [chatAreaWidth, selectedTab, showCollapsed, setShowCollapsed]);
+  }, [chatAreaWidth, selectedTab, showCollapsed, setShowCollapsed, width]);
 
   // Single render point for VerticalTokenMeter
   // Shows when: (1) collapsed, OR (2) Review tab is active
