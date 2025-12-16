@@ -24,6 +24,7 @@ import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
 import {
   getModelKey,
   getInputKey,
+  getInputImagesKey,
   VIM_ENABLED_KEY,
   getProjectScopeId,
   getPendingScopeId,
@@ -78,9 +79,16 @@ import { useCreationWorkspace } from "./useCreationWorkspace";
 import { useTutorial } from "@/browser/contexts/TutorialContext";
 import { useVoiceInput } from "@/browser/hooks/useVoiceInput";
 import { VoiceInputButton } from "./VoiceInputButton";
+import {
+  estimatePersistedImageAttachmentsChars,
+  readPersistedImageAttachments,
+} from "./draftImagesStorage";
 import { RecordingOverlay } from "./RecordingOverlay";
 import { ReviewBlockFromData } from "../shared/ReviewBlock";
 
+// localStorage quotas are environment-dependent and relatively small.
+// Be conservative here so we can warn the user before writes start failing.
+const MAX_PERSISTED_IMAGE_DRAFT_CHARS = 4_000_000;
 type TokenCountReader = () => number;
 
 function createTokenCountResource(promise: Promise<number>): TokenCountReader {
@@ -132,13 +140,16 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // Storage keys differ by variant
   const storageKeys = (() => {
     if (variant === "creation") {
+      const pendingScopeId = getPendingScopeId(props.projectPath);
       return {
-        inputKey: getInputKey(getPendingScopeId(props.projectPath)),
+        inputKey: getInputKey(pendingScopeId),
+        imagesKey: getInputImagesKey(pendingScopeId),
         modelKey: getModelKey(getProjectScopeId(props.projectPath)),
       };
     }
     return {
       inputKey: getInputKey(props.workspaceId),
+      imagesKey: getInputImagesKey(props.workspaceId),
       modelKey: getModelKey(props.workspaceId),
     };
   })();
@@ -150,10 +161,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const [commandSuggestions, setCommandSuggestions] = useState<SlashSuggestion[]>([]);
   const [providerNames, setProviderNames] = useState<string[]>([]);
   const [toast, setToast] = useState<Toast | null>(null);
-  const [imageAttachments, setImageAttachments] = useState<ImageAttachment[]>([]);
-  // Attached reviews come from parent via props (persisted in pendingReviews state)
-  const attachedReviews = variant === "workspace" ? (props.attachedReviews ?? []) : [];
-
   const pushToast = useCallback(
     (nextToast: Omit<Toast, "id">) => {
       setToast({ id: Date.now().toString(), ...nextToast });
@@ -163,6 +170,60 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const handleToastDismiss = useCallback(() => {
     setToast(null);
   }, []);
+
+  const imageDraftTooLargeToastKeyRef = useRef<string | null>(null);
+
+  const [imageAttachments, setImageAttachmentsState] = useState<ImageAttachment[]>(() => {
+    return readPersistedImageAttachments(storageKeys.imagesKey);
+  });
+  const persistImageAttachments = useCallback(
+    (nextImages: ImageAttachment[]) => {
+      if (nextImages.length === 0) {
+        imageDraftTooLargeToastKeyRef.current = null;
+        updatePersistedState<ImageAttachment[] | undefined>(storageKeys.imagesKey, undefined);
+        return;
+      }
+
+      const estimatedChars = estimatePersistedImageAttachmentsChars(nextImages);
+      if (estimatedChars > MAX_PERSISTED_IMAGE_DRAFT_CHARS) {
+        // Clear persisted value to avoid restoring stale images on restart.
+        updatePersistedState<ImageAttachment[] | undefined>(storageKeys.imagesKey, undefined);
+
+        if (imageDraftTooLargeToastKeyRef.current !== storageKeys.imagesKey) {
+          imageDraftTooLargeToastKeyRef.current = storageKeys.imagesKey;
+          pushToast({
+            type: "error",
+            message:
+              "This draft image is too large to save. It will be lost when you switch workspaces or restart.",
+            duration: 5000,
+          });
+        }
+        return;
+      }
+
+      imageDraftTooLargeToastKeyRef.current = null;
+      updatePersistedState<ImageAttachment[] | undefined>(storageKeys.imagesKey, nextImages);
+    },
+    [storageKeys.imagesKey, pushToast]
+  );
+
+  // Keep image drafts in sync when the storage scope changes (e.g. switching creation projects).
+  useEffect(() => {
+    imageDraftTooLargeToastKeyRef.current = null;
+    setImageAttachmentsState(readPersistedImageAttachments(storageKeys.imagesKey));
+  }, [storageKeys.imagesKey]);
+  const setImageAttachments = useCallback(
+    (value: ImageAttachment[] | ((prev: ImageAttachment[]) => ImageAttachment[])) => {
+      setImageAttachmentsState((prev) => {
+        const next = value instanceof Function ? value(prev) : value;
+        persistImageAttachments(next);
+        return next;
+      });
+    },
+    [persistImageAttachments]
+  );
+  // Attached reviews come from parent via props (persisted in pendingReviews state)
+  const attachedReviews = variant === "workspace" ? (props.attachedReviews ?? []) : [];
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const modelSelectorRef = useRef<ModelSelectorRef>(null);
 
@@ -181,7 +242,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       setInput(draft.text);
       setImageAttachments(draft.images);
     },
-    [setInput]
+    [setInput, setImageAttachments]
   );
   const preEditDraftRef = useRef<DraftState>({ text: "", images: [] });
   const { open } = useSettings();
@@ -387,14 +448,17 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   );
 
   // Method to restore images to input (used by queued message edit)
-  const restoreImages = useCallback((images: ImagePart[]) => {
-    const attachments: ImageAttachment[] = images.map((img, index) => ({
-      id: `restored-${Date.now()}-${index}`,
-      url: img.url,
-      mediaType: img.mediaType,
-    }));
-    setImageAttachments(attachments);
-  }, []);
+  const restoreImages = useCallback(
+    (images: ImagePart[]) => {
+      const attachments: ImageAttachment[] = images.map((img, index) => ({
+        id: `restored-${Date.now()}-${index}`,
+        url: img.url,
+        mediaType: img.mediaType,
+      }));
+      setImageAttachments(attachments);
+    },
+    [setImageAttachments]
+  );
 
   // Provide API to parent via callback
   useEffect(() => {
@@ -678,24 +742,30 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   }, [variant, workspaceIdForFocus, focusMessageInput, setChatInputAutoFocusState]);
 
   // Handle paste events to extract images
-  const handlePaste = useCallback((e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-    const items = e.clipboardData?.items;
-    if (!items) return;
+  const handlePaste = useCallback(
+    (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
 
-    const imageFiles = extractImagesFromClipboard(items);
-    if (imageFiles.length === 0) return;
+      const imageFiles = extractImagesFromClipboard(items);
+      if (imageFiles.length === 0) return;
 
-    e.preventDefault(); // Prevent default paste behavior for images
+      e.preventDefault(); // Prevent default paste behavior for images
 
-    void processImageFiles(imageFiles).then((attachments) => {
-      setImageAttachments((prev) => [...prev, ...attachments]);
-    });
-  }, []);
+      void processImageFiles(imageFiles).then((attachments) => {
+        setImageAttachments((prev) => [...prev, ...attachments]);
+      });
+    },
+    [setImageAttachments]
+  );
 
   // Handle removing an image attachment
-  const handleRemoveImage = useCallback((id: string) => {
-    setImageAttachments((prev) => prev.filter((img) => img.id !== id));
-  }, []);
+  const handleRemoveImage = useCallback(
+    (id: string) => {
+      setImageAttachments((prev) => prev.filter((img) => img.id !== id));
+    },
+    [setImageAttachments]
+  );
 
   // Handle drag over to allow drop
   const handleDragOver = useCallback((e: React.DragEvent<HTMLTextAreaElement>) => {
@@ -707,16 +777,19 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   }, []);
 
   // Handle drop to extract images
-  const handleDrop = useCallback((e: React.DragEvent<HTMLTextAreaElement>) => {
-    e.preventDefault();
+  const handleDrop = useCallback(
+    (e: React.DragEvent<HTMLTextAreaElement>) => {
+      e.preventDefault();
 
-    const imageFiles = extractImagesFromDrop(e.dataTransfer);
-    if (imageFiles.length === 0) return;
+      const imageFiles = extractImagesFromDrop(e.dataTransfer);
+      if (imageFiles.length === 0) return;
 
-    void processImageFiles(imageFiles).then((attachments) => {
-      setImageAttachments((prev) => [...prev, ...attachments]);
-    });
-  }, []);
+      void processImageFiles(imageFiles).then((attachments) => {
+        setImageAttachments((prev) => [...prev, ...attachments]);
+      });
+    },
+    [setImageAttachments]
+  );
 
   // Handle command selection
   const handleCommandSelect = useCallback(
