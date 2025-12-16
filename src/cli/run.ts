@@ -43,6 +43,7 @@ import { parseRuntimeModeAndHost, RUNTIME_MODE } from "@/common/types/runtime";
 import assert from "@/common/utils/assert";
 import parseDuration from "parse-duration";
 import { log, type LogLevel } from "@/node/services/log";
+import { getParseOptions } from "./argv";
 
 type CLIMode = "plan" | "exec";
 
@@ -212,7 +213,7 @@ Examples:
 `
   );
 
-program.parse(process.argv);
+program.parse(process.argv, getParseOptions());
 
 interface CLIOptions {
   dir: string;
