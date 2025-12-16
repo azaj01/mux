@@ -245,10 +245,10 @@ export function getStatusStateKey(workspaceId: string): string {
 export const RIGHT_SIDEBAR_TAB_KEY = "right-sidebar-tab";
 
 /**
- * Right sidebar collapsed state (global)
- * Format: "right-sidebar:collapsed"
+ * Right sidebar hidden state (global, auto-collapse on small screens)
+ * Format: "right-sidebar:hidden"
  */
-export const RIGHT_SIDEBAR_COLLAPSED_KEY = "right-sidebar:collapsed";
+export const RIGHT_SIDEBAR_COLLAPSED_KEY = "right-sidebar:hidden";
 
 /**
  * Right sidebar width for Costs tab (global)

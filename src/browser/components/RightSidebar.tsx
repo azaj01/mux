@@ -22,7 +22,6 @@ export interface ReviewStats {
 }
 
 interface SidebarContainerProps {
-  collapsed: boolean;
   wide?: boolean;
   /** Custom width from drag-resize (persisted per-tab by AIView) */
   customWidth?: number;
@@ -37,13 +36,11 @@ interface SidebarContainerProps {
  * SidebarContainer - Main sidebar wrapper with dynamic width
  *
  * Width priority (first match wins):
- * 1. collapsed (20px) - Shows vertical token meter only
- * 2. customWidth - From drag-resize (persisted per-tab)
- * 3. wide - Auto-calculated max width for Review tab (when not drag-resizing)
- * 4. default (300px) - Costs tab when no customWidth saved
+ * 1. customWidth - From drag-resize (persisted per-tab)
+ * 2. wide - Auto-calculated max width for Review tab (when not drag-resizing)
+ * 3. default (300px) - Costs tab when no customWidth saved
  */
 const SidebarContainer: React.FC<SidebarContainerProps> = ({
-  collapsed,
   wide,
   customWidth,
   isResizing,
@@ -51,23 +48,19 @@ const SidebarContainer: React.FC<SidebarContainerProps> = ({
   role,
   "aria-label": ariaLabel,
 }) => {
-  const width = collapsed
-    ? "20px"
-    : customWidth
-      ? `${customWidth}px`
-      : wide
-        ? "min(1200px, calc(100vw - 400px))"
-        : "300px";
+  const width = customWidth
+    ? `${customWidth}px`
+    : wide
+      ? "min(1200px, calc(100vw - 400px))"
+      : "300px";
 
   return (
     <div
       className={cn(
         "bg-sidebar border-l border-border-light flex flex-col overflow-hidden flex-shrink-0",
         !isResizing && "transition-[width] duration-200",
-        collapsed && "sticky right-0 z-10 shadow-[-2px_0_4px_rgba(0,0,0,0.2)]",
-        // Mobile: Show vertical meter when collapsed (20px), full width when expanded
-        "max-md:border-l-0 max-md:border-t max-md:border-border-light",
-        !collapsed && "max-md:w-full max-md:relative max-md:max-h-[50vh]"
+        // Mobile: full width
+        "max-md:border-l-0 max-md:border-t max-md:border-border-light max-md:w-full max-md:relative max-md:max-h-[50vh]"
       )}
       style={{ width }}
       role={role}
@@ -180,57 +173,47 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       : { segments: [], totalTokens: 0, totalPercentage: 0 };
   }, [lastUsage, model, use1M]);
 
-  // Calculate if we should show collapsed view with hysteresis
-  // Strategy: Observe ChatArea width directly (independent of sidebar width)
-  // - ChatArea has min-width: 750px and flex: 1
-  // - Use hysteresis to prevent oscillation:
-  //   * Collapse when chatAreaWidth <= 800px (tight space)
-  //   * Expand when chatAreaWidth >= 1100px (lots of space)
-  //   * Between 800-1100: maintain current state (dead zone)
-  const COLLAPSE_THRESHOLD = 800; // Collapse below this
-  const EXPAND_THRESHOLD = 1100; // Expand above this
+  // Auto-hide sidebar on small screens using hysteresis to prevent oscillation
+  // - Observe ChatArea width directly (independent of sidebar width)
+  // - ChatArea has min-width and flex: 1
+  // - Collapse when chatAreaWidth <= 800px (tight space)
+  // - Expand when chatAreaWidth >= 1100px (lots of space)
+  // - Between 800-1100: maintain current state (dead zone)
+  const COLLAPSE_THRESHOLD = 800;
+  const EXPAND_THRESHOLD = 1100;
   const chatAreaWidth = chatAreaSize?.width ?? 1000; // Default to large to avoid flash
 
   // Persist collapsed state globally (not per-workspace) since chat area width is shared
-  // This prevents animation flash when switching workspaces - sidebar maintains its state
-  const [showCollapsed, setShowCollapsed] = usePersistedState<boolean>(
-    RIGHT_SIDEBAR_COLLAPSED_KEY,
-    false
-  );
+  const [isHidden, setIsHidden] = usePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
 
   React.useEffect(() => {
-    // Never collapse when Review tab is active - code review needs space
+    // Never hide when Review tab is active - code review needs space
     if (selectedTab === "review") {
-      if (showCollapsed) {
-        setShowCollapsed(false);
+      if (isHidden) {
+        setIsHidden(false);
       }
       return;
     }
 
-    // If the sidebar is custom-resized (wider than the default Costs width),
-    // auto-collapse based on chatAreaWidth can oscillate between expanded and
-    // collapsed states (because collapsed is 20px but expanded can be much wider),
-    // which looks like a constant flash. In that case, keep it expanded and let
-    // the user resize manually.
+    // If sidebar is custom-resized wider than default, don't auto-hide
+    // (would cause oscillation between hidden and wide states)
     if (width !== undefined && width > 300) {
-      if (showCollapsed) {
-        setShowCollapsed(false);
+      if (isHidden) {
+        setIsHidden(false);
       }
       return;
     }
 
-    // Normal hysteresis for Costs/Tools tabs
+    // Normal hysteresis for Costs tab
     if (chatAreaWidth <= COLLAPSE_THRESHOLD) {
-      setShowCollapsed(true);
+      setIsHidden(true);
     } else if (chatAreaWidth >= EXPAND_THRESHOLD) {
-      setShowCollapsed(false);
+      setIsHidden(false);
     }
     // Between thresholds: maintain current state (no change)
-  }, [chatAreaWidth, selectedTab, showCollapsed, setShowCollapsed, width]);
+  }, [chatAreaWidth, selectedTab, isHidden, setIsHidden, width]);
 
-  // Single render point for VerticalTokenMeter
-  // Shows when: (1) collapsed, OR (2) Review tab is active
-  const showMeter = showCollapsed || selectedTab === "review";
+  // Vertical meter only shows on Review tab (context usage indicator is now in ChatInput)
   const autoCompactionProps = React.useMemo(
     () => ({
       threshold: autoCompactThreshold,
@@ -238,21 +221,25 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     }),
     [autoCompactThreshold, setAutoCompactThreshold]
   );
-  const verticalMeter = showMeter ? (
-    <VerticalTokenMeter data={verticalMeterData} autoCompaction={autoCompactionProps} />
-  ) : null;
+  const verticalMeter =
+    selectedTab === "review" ? (
+      <VerticalTokenMeter data={verticalMeterData} autoCompaction={autoCompactionProps} />
+    ) : null;
+
+  // Fully hide sidebar on small screens (context usage now shown in ChatInput)
+  if (isHidden) {
+    return null;
+  }
 
   return (
     <SidebarContainer
-      collapsed={showCollapsed}
       wide={selectedTab === "review" && !width} // Auto-wide only if not drag-resizing
       customWidth={width} // Per-tab resized width from AIView
       isResizing={isResizing}
       role="complementary"
       aria-label="Workspace insights"
     >
-      {/* Full view when not collapsed */}
-      <div className={cn("flex-row h-full", !showCollapsed ? "flex" : "hidden")}>
+      <div className="flex h-full flex-row">
         {/* Resize handle (left edge) */}
         {onStartResize && (
           <div
@@ -368,8 +355,6 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
           </div>
         </div>
       </div>
-      {/* Render meter in collapsed view when sidebar is collapsed */}
-      <div className={cn("h-full", showCollapsed ? "flex" : "hidden")}>{verticalMeter}</div>
     </SidebarContainer>
   );
 };
