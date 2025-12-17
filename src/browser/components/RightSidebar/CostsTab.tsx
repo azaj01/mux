@@ -236,7 +236,7 @@ const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
                       name: "Cache Create",
                       tokens: displayUsage.cacheCreate.tokens,
                       cost: displayUsage.cacheCreate.cost_usd,
-                      color: TOKEN_COMPONENT_COLORS.cached,
+                      color: TOKEN_COMPONENT_COLORS.cacheCreate,
                       show: displayUsage.cacheCreate.tokens > 0,
                     },
                     {
@@ -312,7 +312,7 @@ const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
                               className="h-full transition-[width] duration-300"
                               style={{
                                 width: `${cacheCreateCostPercentage}%`,
-                                background: TOKEN_COMPONENT_COLORS.cached,
+                                background: TOKEN_COMPONENT_COLORS.cacheCreate,
                               }}
                             />
                           )}
