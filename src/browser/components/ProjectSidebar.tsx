@@ -18,6 +18,8 @@ import {
   formatDaysThreshold,
   AGE_THRESHOLDS_DAYS,
   computeWorkspaceDepthMap,
+  findNextNonEmptyTier,
+  getTierKey,
 } from "@/browser/utils/ui/workspaceFiltering";
 import { Tooltip, TooltipTrigger, TooltipContent } from "./ui/tooltip";
 import { SidebarCollapseButton } from "./ui/SidebarCollapseButton";
@@ -249,7 +251,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   );
 
   // Track which projects have old workspaces expanded (per-project, per-tier)
-  // Key format: `${projectPath}:${tierIndex}` where tierIndex is 0, 1, 2 for 1/7/30 days
+  // Key format: getTierKey(projectPath, tierIndex) where tierIndex is 0, 1, 2 for 1/7/30 days
   const [expandedOldWorkspaces, setExpandedOldWorkspaces] = usePersistedState<
     Record<string, boolean>
   >("expandedOldWorkspaces", {});
@@ -287,7 +289,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   );
 
   const toggleOldWorkspaces = (projectPath: string, tierIndex: number) => {
-    const key = `${projectPath}:${tierIndex}`;
+    const key = getTierKey(projectPath, tierIndex);
     setExpandedOldWorkspaces((prev) => ({
       ...prev,
       [key]: !prev[key],
@@ -592,14 +594,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                 />
                               );
 
-                              // Find the next tier with workspaces (skip empty tiers)
-                              const findNextNonEmptyTier = (startIndex: number): number => {
-                                for (let i = startIndex; i < buckets.length; i++) {
-                                  if (buckets[i].length > 0) return i;
-                                }
-                                return -1;
-                              };
-
                               // Render a tier and all subsequent tiers recursively
                               // Each tier only shows if the previous tier is expanded
                               // Empty tiers are skipped automatically
@@ -612,8 +606,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
 
                                 if (remainingCount === 0) return null;
 
-                                const key = `${projectPath}:${tierIndex}`;
-                                const isExpanded = expandedOldWorkspaces[key] ?? false;
+                                const isExpanded =
+                                  expandedOldWorkspaces[getTierKey(projectPath, tierIndex)] ??
+                                  false;
                                 const thresholdDays = AGE_THRESHOLDS_DAYS[tierIndex];
                                 const thresholdLabel = formatDaysThreshold(thresholdDays);
                                 // When expanded, show only this tier's count; when collapsed, show cumulative
@@ -650,7 +645,10 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                       <>
                                         {bucket.map(renderWorkspace)}
                                         {(() => {
-                                          const nextTier = findNextNonEmptyTier(tierIndex + 1);
+                                          const nextTier = findNextNonEmptyTier(
+                                            buckets,
+                                            tierIndex + 1
+                                          );
                                           return nextTier !== -1 ? renderTier(nextTier) : null;
                                         })()}
                                       </>
@@ -660,7 +658,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                               };
 
                               // Find first non-empty tier to start rendering
-                              const firstTier = findNextNonEmptyTier(0);
+                              const firstTier = findNextNonEmptyTier(buckets, 0);
 
                               return (
                                 <>
