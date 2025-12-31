@@ -74,11 +74,13 @@ import { MockScenarioPlayer } from "./mock/mockScenarioPlayer";
 import { EnvHttpProxyAgent, type Dispatcher } from "undici";
 import { getPlanFilePath } from "@/common/utils/planStorage";
 import { getPlanFileHint, getPlanModeInstruction } from "@/common/utils/ui/modeUtils";
-import type { AgentMode, UIMode } from "@/common/types/mode";
+import type { AgentMode } from "@/common/types/mode";
 import { MUX_APP_ATTRIBUTION_TITLE, MUX_APP_ATTRIBUTION_URL } from "@/constants/appAttribution";
 import { readPlanFile } from "@/node/utils/runtime/helpers";
 import { readAgentDefinition } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { resolveToolPolicyForAgent } from "@/node/services/agentDefinitions/resolveToolPolicy";
+import { getBuiltInAgentDefinitions } from "@/node/services/agentDefinitions/builtInAgentDefinitions";
+import { isPlanLike } from "@/common/utils/agentInheritance";
 
 // Export a standalone version of getToolsForModel for use in backend
 
@@ -1135,9 +1137,23 @@ export class AIService extends EventEmitter {
         agentDefinition = await readAgentDefinition(runtime, workspacePath, "exec");
       }
 
-      const effectiveMode: AgentMode = agentDefinition.frontmatter.policy?.base ?? "exec";
-      const uiMode: UIMode | undefined =
-        effectiveMode === "plan" ? "plan" : effectiveMode === "exec" ? "exec" : undefined;
+      // Determine if agent is plan-like by checking if propose_plan is in its resolved tools
+      // (including inherited tools from base agents)
+      const builtInAgents = getBuiltInAgentDefinitions();
+      const allAgents = [
+        ...builtInAgents.map((pkg) => ({
+          id: pkg.id,
+          base: pkg.frontmatter.base,
+          tools: pkg.frontmatter.tools,
+        })),
+        {
+          id: effectiveAgentId,
+          base: agentDefinition.frontmatter.base,
+          tools: agentDefinition.frontmatter.tools,
+        },
+      ];
+      const agentIsPlanLike = isPlanLike(effectiveAgentId, allAgents);
+      const effectiveMode: AgentMode = agentIsPlanLike ? "plan" : "exec";
 
       const cfg = this.config.loadConfigOrDefault();
       const taskSettings = cfg.taskSettings ?? DEFAULT_TASK_SETTINGS;
@@ -1146,17 +1162,19 @@ export class AIService extends EventEmitter {
 
       const isSubagentWorkspace = Boolean(metadata.parentWorkspaceId);
 
-      // NOTE: Agent tool policy is applied after any caller-supplied policy so callers cannot
-      // broaden the tool set (e.g., re-enable propose_plan in exec mode).
+      // NOTE: Caller-supplied policy is applied AFTER agent tool policy so callers can
+      // further restrict the tool set (e.g., disable all tools for testing).
+      // Agent policy establishes baseline (deny-all + enable whitelist + runtime restrictions).
+      // Caller policy then narrows further if needed.
       const agentToolPolicy = resolveToolPolicyForAgent({
-        base: effectiveMode,
+        agentId: effectiveAgentId,
         frontmatter: agentDefinition.frontmatter,
         isSubagent: isSubagentWorkspace,
         disableTaskToolsForDepth: shouldDisableTaskToolsForDepth,
       });
       const effectiveToolPolicy: ToolPolicy | undefined =
         toolPolicy || agentToolPolicy.length > 0
-          ? [...(toolPolicy ?? []), ...agentToolPolicy]
+          ? [...agentToolPolicy, ...(toolPolicy ?? [])]
           : undefined;
 
       // Compute tool names for mode transition sentinel.
@@ -1168,7 +1186,7 @@ export class AIService extends EventEmitter {
           runtime: earlyRuntime,
           runtimeTempDir: os.tmpdir(),
           secrets: {},
-          mode: uiMode,
+          mode: effectiveMode,
         },
         "", // Empty workspace ID for early stub config
         this.initStateManager,
@@ -1335,6 +1353,13 @@ export class AIService extends EventEmitter {
         }
       }
 
+      // Construct effective agent system prompt
+      // If running as subagent and agent has subagent.append_prompt, append it to the body
+      const agentSystemPrompt =
+        isSubagentWorkspace && agentDefinition.frontmatter.subagent?.append_prompt
+          ? `${agentDefinition.body}\n\n${agentDefinition.frontmatter.subagent.append_prompt}`
+          : agentDefinition.body;
+
       // Build system message from workspace metadata
       const systemMessage = await buildSystemMessage(
         metadata,
@@ -1346,7 +1371,7 @@ export class AIService extends EventEmitter {
         mcpServers,
         {
           agentId: effectiveAgentId,
-          agentSystemPrompt: agentDefinition.body,
+          agentSystemPrompt,
         }
       );
 
@@ -1388,13 +1413,11 @@ export class AIService extends EventEmitter {
       const runtimeTempDir = await this.streamManager.createTempDirForStream(streamToken, runtime);
 
       // Extract tool-specific instructions from AGENTS.md files
-      // Pass uiMode so ask_user_question is included in plan mode
       const toolInstructions = await readToolInstructions(
         metadata,
         runtime,
         workspacePath,
-        modelString,
-        uiMode === "plan" ? "plan" : "exec"
+        modelString
       );
 
       // Get model-specific tools with workspace path (correct for local or remote)
@@ -1418,7 +1441,7 @@ export class AIService extends EventEmitter {
           // Plan/exec mode configuration for plan file access.
           // - read: plan file is readable in all modes (useful context)
           // - write: enforced by file_edit_* tools (plan file is read-only outside plan mode)
-          mode: uiMode,
+          mode: effectiveMode,
           emitChatEvent: (event) => {
             // Defensive: tools should only emit events for the workspace they belong to.
             if ("workspaceId" in event && event.workspaceId !== workspaceId) {
@@ -1605,7 +1628,7 @@ export class AIService extends EventEmitter {
           model: modelString,
           historySequence,
           startTime: Date.now(),
-          ...(uiMode && { mode: uiMode }),
+          mode: effectiveMode,
         };
         this.emit("stream-start", streamStartEvent);
 
@@ -1642,7 +1665,7 @@ export class AIService extends EventEmitter {
           model: modelString,
           historySequence,
           startTime: Date.now(),
-          ...(uiMode && { mode: uiMode }),
+          mode: effectiveMode,
         };
         this.emit("stream-start", streamStartEvent);
 

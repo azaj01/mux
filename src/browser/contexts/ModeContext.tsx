@@ -1,5 +1,13 @@
 import type { Dispatch, ReactNode, SetStateAction } from "react";
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import React, {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import { useAPI } from "@/browser/contexts/API";
 import { AgentProvider } from "@/browser/contexts/AgentContext";
@@ -13,12 +21,12 @@ import { matchesKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import {
   getAgentIdKey,
   getModeKey,
-  getPinnedAgentIdKey,
   getProjectScopeId,
   GLOBAL_SCOPE_ID,
 } from "@/common/constants/storage";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import type { UIMode } from "@/common/types/mode";
+import { isPlanLike } from "@/common/utils/agentInheritance";
 
 type ModeContextType = [UIMode, (mode: UIMode) => void];
 
@@ -34,19 +42,14 @@ function getScopeId(workspaceId: string | undefined, projectPath: string | undef
   return workspaceId ?? (projectPath ? getProjectScopeId(projectPath) : GLOBAL_SCOPE_ID);
 }
 
-function normalizeOptionalAgentId(value: unknown): string {
-  return typeof value === "string" && value.trim().length > 0 ? value.trim().toLowerCase() : "";
-}
-
 function coerceAgentId(value: unknown): string {
   return typeof value === "string" && value.trim().length > 0 ? value.trim().toLowerCase() : "exec";
 }
 
 function resolveModeFromAgentId(agentId: string, agents: AgentDefinitionDescriptor[]): UIMode {
   const normalizedAgentId = coerceAgentId(agentId);
-  const descriptor = agents.find((entry) => entry.id === normalizedAgentId);
-  const base = descriptor?.policyBase ?? (normalizedAgentId === "plan" ? "plan" : "exec");
-  return base === "plan" ? "plan" : "exec";
+  // Use proper inheritance check for multi-level support
+  return isPlanLike(normalizedAgentId, agents) ? "plan" : "exec";
 }
 
 export const ModeProvider: React.FC<ModeProviderProps> = (props) => {
@@ -74,55 +77,57 @@ export const ModeProvider: React.FC<ModeProviderProps> = (props) => {
   const [agents, setAgents] = useState<AgentDefinitionDescriptor[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [loadFailed, setLoadFailed] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
 
-  const [pinnedAgentIdRaw] = usePersistedState<string>(getPinnedAgentIdKey(scopeId), "", {
-    listener: true,
-  });
+  // Track current workspace to avoid stale updates
+  const workspaceIdRef = useRef(props.workspaceId);
+  workspaceIdRef.current = props.workspaceId;
 
-  const cycleOtherAgentId = useMemo(() => {
-    const pinnedAgentId = normalizeOptionalAgentId(pinnedAgentIdRaw);
-    if (!pinnedAgentId || pinnedAgentId === "exec" || pinnedAgentId === "plan") {
-      return "";
-    }
-
-    // If we have a resolved agent list, ensure the pinned agent is still selectable.
-    if (agents.length > 0) {
-      const descriptor = agents.find((entry) => entry.id === pinnedAgentId);
-      if (!descriptor?.uiSelectable) {
-        return "";
+  const fetchAgents = useCallback(
+    async (workspaceId: string | undefined) => {
+      if (!api || !workspaceId) {
+        setAgents([]);
+        setLoaded(true);
+        setLoadFailed(false);
+        return;
       }
-    }
 
-    return pinnedAgentId;
-  }, [agents, pinnedAgentIdRaw]);
+      try {
+        const result = await api.agents.list({ workspaceId });
+        // Guard against stale updates if workspace changed mid-fetch
+        if (workspaceIdRef.current === workspaceId) {
+          setAgents(result);
+          setLoadFailed(false);
+          setLoaded(true);
+        }
+      } catch {
+        if (workspaceIdRef.current === workspaceId) {
+          setAgents([]);
+          setLoadFailed(true);
+          setLoaded(true);
+        }
+      }
+    },
+    [api]
+  );
 
+  // Initial fetch
   useEffect(() => {
-    if (!api) return;
-
-    // Only discover agents in the context of an existing workspace.
-    if (!props.workspaceId) {
-      setAgents([]);
-      setLoaded(true);
-      setLoadFailed(false);
-      return;
-    }
-
     setLoaded(false);
     setLoadFailed(false);
+    void fetchAgents(props.workspaceId);
+  }, [fetchAgents, props.workspaceId]);
 
-    void api.agents
-      .list({ workspaceId: props.workspaceId })
-      .then((result) => {
-        setAgents(result);
-        setLoadFailed(false);
-        setLoaded(true);
-      })
-      .catch(() => {
-        setAgents([]);
-        setLoadFailed(true);
-        setLoaded(true);
-      });
-  }, [api, props.workspaceId]);
+  // Manual refresh function
+  const refresh = useCallback(async () => {
+    if (!props.workspaceId) return;
+    setRefreshing(true);
+    try {
+      await fetchAgents(props.workspaceId);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [fetchAgents, props.workspaceId]);
 
   const mode = useMemo(() => resolveModeFromAgentId(agentId, agents), [agentId, agents]);
 
@@ -142,7 +147,7 @@ export const ModeProvider: React.FC<ModeProviderProps> = (props) => {
     [setAgentId]
   );
 
-  // Global keybind handler
+  // Global keybind handler - opens the agent picker dropdown
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (!matchesKeybind(e, KEYBINDS.TOGGLE_MODE)) {
@@ -150,32 +155,12 @@ export const ModeProvider: React.FC<ModeProviderProps> = (props) => {
       }
 
       e.preventDefault();
-
-      // Best-effort: if the agent picker is open, close it before cycling.
-      window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.CLOSE_AGENT_PICKER));
-
-      const normalizedAgentId = coerceAgentId(agentId);
-
-      // Cycle Exec -> Plan -> Other (pinned) -> Exec.
-      if (normalizedAgentId === "exec") {
-        setAgentId("plan");
-        return;
-      }
-
-      if (normalizedAgentId === "plan") {
-        if (cycleOtherAgentId) {
-          setAgentId(cycleOtherAgentId);
-        }
-        window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.OPEN_AGENT_PICKER));
-        return;
-      }
-
-      setAgentId("exec");
+      window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.OPEN_AGENT_PICKER));
     };
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [agentId, cycleOtherAgentId, setAgentId]);
+  }, []);
 
   const agentContextValue = useMemo(
     () => ({
@@ -184,8 +169,10 @@ export const ModeProvider: React.FC<ModeProviderProps> = (props) => {
       agents,
       loaded,
       loadFailed,
+      refresh,
+      refreshing,
     }),
-    [agentId, agents, loaded, loadFailed, setAgentId]
+    [agentId, agents, loaded, loadFailed, refresh, refreshing, setAgentId]
   );
 
   const modeContextValue: ModeContextType = [mode, setMode];

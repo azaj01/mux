@@ -22,6 +22,7 @@ import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useMode } from "@/browser/contexts/ModeContext";
 import { useAgent } from "@/browser/contexts/AgentContext";
+import { resolveAgentProperty, isPlanLike } from "@/common/utils/agentInheritance";
 import { ThinkingSliderComponent } from "../ThinkingSlider";
 import { ModelSettings } from "../ModelSettings";
 import { useAPI } from "@/browser/contexts/API";
@@ -303,7 +304,19 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const { open } = useSettings();
   const { selectedWorkspace } = useWorkspaceContext();
   const [mode] = useMode();
-  const { agentId } = useAgent();
+  const { agentId, agents } = useAgent();
+
+  // Get the active agent's uiColor for focus border styling (respects inheritance)
+  // Falls back to plan/exec mode colors based on agent's tool policy
+  const focusBorderColor = useMemo(() => {
+    if (!agentId) {
+      return "var(--color-exec-mode)";
+    }
+    const color = resolveAgentProperty(agentId, "uiColor", agents);
+    if (color) return color;
+    // Fallback: use plan color if agent has propose_plan, otherwise exec
+    return isPlanLike(agentId, agents) ? "var(--color-plan-mode)" : "var(--color-exec-mode)";
+  }, [agentId, agents]);
   const {
     models,
     customModels,
@@ -1932,7 +1945,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                   ref={inputRef}
                   value={input}
                   isEditing={!!editingMessage}
-                  mode={mode}
+                  focusBorderColor={focusBorderColor}
                   onChange={setInput}
                   onKeyDown={handleKeyDown}
                   onPaste={handlePaste}
@@ -2073,13 +2086,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                     autoCompaction={autoCompactionProps}
                   />
                 )}
-                <AgentModePicker
-                  workspaceId={variant === "workspace" ? props.workspaceId : undefined}
-                  projectPath={
-                    variant === "creation" ? props.projectPath : selectedWorkspace?.projectPath
-                  }
-                  onComplete={() => inputRef.current?.focus()}
-                />
+                <AgentModePicker onComplete={() => inputRef.current?.focus()} />
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <button
