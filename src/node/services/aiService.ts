@@ -79,8 +79,8 @@ import { MUX_APP_ATTRIBUTION_TITLE, MUX_APP_ATTRIBUTION_URL } from "@/constants/
 import { readPlanFile } from "@/node/utils/runtime/helpers";
 import { readAgentDefinition } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { resolveToolPolicyForAgent } from "@/node/services/agentDefinitions/resolveToolPolicy";
-import { getBuiltInAgentDefinitions } from "@/node/services/agentDefinitions/builtInAgentDefinitions";
 import { isPlanLike } from "@/common/utils/agentInheritance";
+import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/resolveAgentInheritanceChain";
 
 // Export a standalone version of getToolsForModel for use in backend
 
@@ -1138,21 +1138,16 @@ export class AIService extends EventEmitter {
       }
 
       // Determine if agent is plan-like by checking if propose_plan is in its resolved tools
-      // (including inherited tools from base agents)
-      const builtInAgents = getBuiltInAgentDefinitions();
-      const allAgents = [
-        ...builtInAgents.map((pkg) => ({
-          id: pkg.id,
-          base: pkg.frontmatter.base,
-          tools: pkg.frontmatter.tools,
-        })),
-        {
-          id: effectiveAgentId,
-          base: agentDefinition.frontmatter.base,
-          tools: agentDefinition.frontmatter.tools,
-        },
-      ];
-      const agentIsPlanLike = isPlanLike(effectiveAgentId, allAgents);
+      // (including inherited tools from base agents).
+      const agentsForInheritance = await resolveAgentInheritanceChain({
+        runtime,
+        workspacePath,
+        agentId: effectiveAgentId,
+        agentDefinition,
+        workspaceId,
+      });
+
+      const agentIsPlanLike = isPlanLike(effectiveAgentId, agentsForInheritance);
       const effectiveMode: AgentMode = agentIsPlanLike ? "plan" : "exec";
 
       const cfg = this.config.loadConfigOrDefault();
@@ -1168,7 +1163,7 @@ export class AIService extends EventEmitter {
       // Caller policy then narrows further if needed.
       const agentToolPolicy = resolveToolPolicyForAgent({
         agentId: effectiveAgentId,
-        frontmatter: agentDefinition.frontmatter,
+        agents: agentsForInheritance,
         isSubagent: isSubagentWorkspace,
         disableTaskToolsForDepth: shouldDisableTaskToolsForDepth,
       });
