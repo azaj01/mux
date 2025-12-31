@@ -150,6 +150,16 @@ export function getPinnedAgentIdKey(scopeId: string): string {
  * Get the localStorage key for the UI mode for a workspace
  * Format: "mode:{workspaceId}"
  */
+
+/**
+ * Get the localStorage key for "disable workspace agents" toggle per scope.
+ * When true, workspace-specific agents are disabled - only built-in and global agents are loaded.
+ * Useful for "unbricking" when iterating on agent files in a workspace worktree.
+ * Format: "disableWorkspaceAgents:{scopeId}"
+ */
+export function getDisableWorkspaceAgentsKey(scopeId: string): string {
+  return `disableWorkspaceAgents:${scopeId}`;
+}
 export function getModeKey(workspaceId: string): string {
   return `mode:${workspaceId}`;
 }

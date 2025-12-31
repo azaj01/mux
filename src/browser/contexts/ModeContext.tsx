@@ -22,6 +22,7 @@ import {
   getAgentIdKey,
   getModeKey,
   getProjectScopeId,
+  getDisableWorkspaceAgentsKey,
   GLOBAL_SCOPE_ID,
 } from "@/common/constants/storage";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
@@ -64,6 +65,13 @@ export const ModeProvider: React.FC<ModeProviderProps> = (props) => {
     listener: true,
   });
 
+  // Toggle to use project agents only (ignore workspace worktree agents)
+  const [disableWorkspaceAgents, setDisableWorkspaceAgents] = usePersistedState<boolean>(
+    getDisableWorkspaceAgentsKey(scopeId),
+    false,
+    { listener: true }
+  );
+
   const setAgentId: Dispatch<SetStateAction<string>> = useCallback(
     (value) => {
       setAgentIdRaw((prev) => {
@@ -79,13 +87,32 @@ export const ModeProvider: React.FC<ModeProviderProps> = (props) => {
   const [loadFailed, setLoadFailed] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
 
-  // Track current workspace to avoid stale updates
-  const workspaceIdRef = useRef(props.workspaceId);
-  workspaceIdRef.current = props.workspaceId;
+  // Track current fetch parameters to avoid stale updates from slow responses.
+  // All three values must match to apply a response - guards against:
+  // - Project changed mid-fetch
+  // - Workspace changed mid-fetch (different worktree)
+  // - disableWorkspaceAgents toggled mid-fetch
+  const fetchParamsRef = useRef({
+    projectPath: props.projectPath,
+    workspaceId: props.workspaceId,
+    disableWorkspaceAgents,
+  });
 
   const fetchAgents = useCallback(
-    async (workspaceId: string | undefined) => {
-      if (!api || !workspaceId) {
+    async (
+      projectPath: string | undefined,
+      workspaceId: string | undefined,
+      workspaceAgentsDisabled: boolean
+    ) => {
+      // Update ref before fetch so we can compare after
+      fetchParamsRef.current = {
+        projectPath,
+        workspaceId,
+        disableWorkspaceAgents: workspaceAgentsDisabled,
+      };
+
+      // Need at least one of projectPath or workspaceId
+      if (!api || (!projectPath && !workspaceId)) {
         setAgents([]);
         setLoaded(true);
         setLoadFailed(false);
@@ -93,15 +120,31 @@ export const ModeProvider: React.FC<ModeProviderProps> = (props) => {
       }
 
       try {
-        const result = await api.agents.list({ workspaceId });
-        // Guard against stale updates if workspace changed mid-fetch
-        if (workspaceIdRef.current === workspaceId) {
+        // Pass workspaceId to use correct runtime (important for SSH), and
+        // disableWorkspaceAgents flag to skip worktree and discover from projectPath.
+        const result = await api.agents.list({
+          projectPath,
+          workspaceId,
+          disableWorkspaceAgents: workspaceAgentsDisabled || undefined,
+        });
+        // Guard against stale updates: only apply if all params still match
+        const current = fetchParamsRef.current;
+        if (
+          current.projectPath === projectPath &&
+          current.workspaceId === workspaceId &&
+          current.disableWorkspaceAgents === workspaceAgentsDisabled
+        ) {
           setAgents(result);
           setLoadFailed(false);
           setLoaded(true);
         }
       } catch {
-        if (workspaceIdRef.current === workspaceId) {
+        const current = fetchParamsRef.current;
+        if (
+          current.projectPath === projectPath &&
+          current.workspaceId === workspaceId &&
+          current.disableWorkspaceAgents === workspaceAgentsDisabled
+        ) {
           setAgents([]);
           setLoadFailed(true);
           setLoaded(true);
@@ -111,23 +154,23 @@ export const ModeProvider: React.FC<ModeProviderProps> = (props) => {
     [api]
   );
 
-  // Initial fetch
+  // Initial fetch and re-fetch when toggle changes
   useEffect(() => {
     setLoaded(false);
     setLoadFailed(false);
-    void fetchAgents(props.workspaceId);
-  }, [fetchAgents, props.workspaceId]);
+    void fetchAgents(props.projectPath, props.workspaceId, disableWorkspaceAgents);
+  }, [fetchAgents, props.projectPath, props.workspaceId, disableWorkspaceAgents]);
 
   // Manual refresh function
   const refresh = useCallback(async () => {
-    if (!props.workspaceId) return;
+    if (!props.projectPath && !props.workspaceId) return;
     setRefreshing(true);
     try {
-      await fetchAgents(props.workspaceId);
+      await fetchAgents(props.projectPath, props.workspaceId, disableWorkspaceAgents);
     } finally {
       setRefreshing(false);
     }
-  }, [fetchAgents, props.workspaceId]);
+  }, [fetchAgents, props.projectPath, props.workspaceId, disableWorkspaceAgents]);
 
   const mode = useMemo(() => resolveModeFromAgentId(agentId, agents), [agentId, agents]);
 
@@ -191,8 +234,20 @@ export const ModeProvider: React.FC<ModeProviderProps> = (props) => {
       loadFailed,
       refresh,
       refreshing,
+      disableWorkspaceAgents,
+      setDisableWorkspaceAgents,
     }),
-    [agentId, agents, loaded, loadFailed, refresh, refreshing, setAgentId]
+    [
+      agentId,
+      agents,
+      loaded,
+      loadFailed,
+      refresh,
+      refreshing,
+      setAgentId,
+      disableWorkspaceAgents,
+      setDisableWorkspaceAgents,
+    ]
   );
 
   const modeContextValue: ModeContextType = [mode, setMode];

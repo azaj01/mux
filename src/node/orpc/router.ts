@@ -33,6 +33,43 @@ import {
 } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 
+/**
+ * Resolves runtime and discovery path for agent operations.
+ * - When workspaceId is provided: uses workspace's runtime config (SSH, local, worktree)
+ * - When only projectPath is provided: uses local runtime with project path
+ * - When disableWorkspaceAgents is true: still uses workspace runtime but discovers from projectPath
+ */
+async function resolveAgentDiscoveryContext(
+  context: ORPCContext,
+  input: { projectPath?: string; workspaceId?: string; disableWorkspaceAgents?: boolean }
+): Promise<{ runtime: ReturnType<typeof createRuntime>; discoveryPath: string }> {
+  if (!input.projectPath && !input.workspaceId) {
+    throw new Error("Either projectPath or workspaceId must be provided");
+  }
+
+  if (input.workspaceId) {
+    const metadataResult = await context.aiService.getWorkspaceMetadata(input.workspaceId);
+    if (!metadataResult.success) {
+      throw new Error(metadataResult.error);
+    }
+    const metadata = metadataResult.data;
+    const runtime = createRuntime(metadata.runtimeConfig, { projectPath: metadata.projectPath });
+    // When workspace agents disabled, discover from project path instead of worktree
+    // (but still use the workspace's runtime for SSH compatibility)
+    const discoveryPath = input.disableWorkspaceAgents
+      ? metadata.projectPath
+      : runtime.getWorkspacePath(metadata.projectPath, metadata.name);
+    return { runtime, discoveryPath };
+  }
+
+  // No workspace - use local runtime with project path
+  const runtime = createRuntime(
+    { type: "local", srcBaseDir: context.config.srcDir },
+    { projectPath: input.projectPath! }
+  );
+  return { runtime, discoveryPath: input.projectPath! };
+}
+
 export const router = (authToken?: string) => {
   const t = os.$context<ORPCContext>().use(createAuthMiddleware(authToken));
 
@@ -411,45 +448,15 @@ export const router = (authToken?: string) => {
         .input(schemas.agents.list.input)
         .output(schemas.agents.list.output)
         .handler(async ({ context, input }) => {
-          const metadataResult = await context.aiService.getWorkspaceMetadata(input.workspaceId);
-          if (!metadataResult.success) {
-            throw new Error(metadataResult.error);
-          }
-
-          const metadata = metadataResult.data;
-          const runtime = createRuntime(
-            metadata.runtimeConfig ?? { type: "local", srcBaseDir: context.config.srcDir },
-            { projectPath: metadata.projectPath }
-          );
-
-          const isInPlace = metadata.projectPath === metadata.name;
-          const workspacePath = isInPlace
-            ? metadata.projectPath
-            : runtime.getWorkspacePath(metadata.projectPath, metadata.name);
-
-          return discoverAgentDefinitions(runtime, workspacePath);
+          const { runtime, discoveryPath } = await resolveAgentDiscoveryContext(context, input);
+          return discoverAgentDefinitions(runtime, discoveryPath);
         }),
       get: t
         .input(schemas.agents.get.input)
         .output(schemas.agents.get.output)
         .handler(async ({ context, input }) => {
-          const metadataResult = await context.aiService.getWorkspaceMetadata(input.workspaceId);
-          if (!metadataResult.success) {
-            throw new Error(metadataResult.error);
-          }
-
-          const metadata = metadataResult.data;
-          const runtime = createRuntime(
-            metadata.runtimeConfig ?? { type: "local", srcBaseDir: context.config.srcDir },
-            { projectPath: metadata.projectPath }
-          );
-
-          const isInPlace = metadata.projectPath === metadata.name;
-          const workspacePath = isInPlace
-            ? metadata.projectPath
-            : runtime.getWorkspacePath(metadata.projectPath, metadata.name);
-
-          return readAgentDefinition(runtime, workspacePath, input.agentId);
+          const { runtime, discoveryPath } = await resolveAgentDiscoveryContext(context, input);
+          return readAgentDefinition(runtime, discoveryPath, input.agentId);
         }),
     },
     providers: {

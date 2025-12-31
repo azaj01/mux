@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, RefreshCw } from "lucide-react";
+import { ChevronDown, FolderX, RefreshCw } from "lucide-react";
 
 import { useAgent } from "@/browser/contexts/AgentContext";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
@@ -188,7 +188,15 @@ function resolveActiveClassName(isPlanLike: boolean): string {
 }
 
 export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
-  const { agentId, setAgentId, agents, refresh, refreshing } = useAgent();
+  const {
+    agentId,
+    setAgentId,
+    agents,
+    refresh,
+    refreshing,
+    disableWorkspaceAgents,
+    setDisableWorkspaceAgents,
+  } = useAgent();
 
   const onComplete = props.onComplete;
 
@@ -490,6 +498,36 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
               placeholder="Search agents…"
               className="text-light bg-dark border-border-light focus:border-exec-mode min-w-0 flex-1 rounded-sm border px-1 py-0.5 text-[10px] leading-[11px] outline-none"
             />
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  aria-label={
+                    disableWorkspaceAgents
+                      ? "Workspace agents disabled (click to enable)"
+                      : "Workspace agents enabled (click to disable)"
+                  }
+                  onClick={() => setDisableWorkspaceAgents((prev) => !prev)}
+                  className={cn(
+                    "flex-shrink-0 p-0.5 transition-colors",
+                    disableWorkspaceAgents
+                      ? "text-red-500 hover:text-red-400"
+                      : "text-muted hover:text-foreground"
+                  )}
+                >
+                  <FolderX className="h-3 w-3" />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" align="end" className="max-w-56">
+                {disableWorkspaceAgents ? (
+                  <span className="text-red-400">
+                    Workspace agents disabled — using built-in/global only. Click to re-enable.
+                  </span>
+                ) : (
+                  "Disable workspace agents (use built-in/global only)"
+                )}
+              </TooltipContent>
+            </Tooltip>
             <Tooltip>
               <TooltipTrigger asChild>
                 <button
