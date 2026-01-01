@@ -8,7 +8,11 @@ import React, {
   useMemo,
   useDeferredValue,
 } from "react";
-import { CommandSuggestions, COMMAND_SUGGESTION_KEYS } from "../CommandSuggestions";
+import {
+  CommandSuggestions,
+  COMMAND_SUGGESTION_KEYS,
+  FILE_SUGGESTION_KEYS,
+} from "../CommandSuggestions";
 import type { Toast } from "../ChatInputToast";
 import { ChatInputToast } from "../ChatInputToast";
 import { createCommandToast, createErrorToast } from "../ChatInputToasts";
@@ -776,12 +780,25 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             // File @mentions are whitespace-delimited (extractAtMentions uses /@(\S+)/), so
             // suggestions containing spaces would be inserted incorrectly (e.g. "@foo bar.ts").
             .filter((p) => !/\s/.test(p))
-            .map((p) => ({
-              id: `file:${p}`,
-              display: p,
-              description: "File",
-              replacement: `@${p}`,
-            }));
+            .map((p) => {
+              // Determine file type from extension or mark as directory
+              const getFileType = (path: string): string => {
+                if (path.endsWith("/")) return "Directory";
+                const lastDot = path.lastIndexOf(".");
+                const lastSlash = path.lastIndexOf("/");
+                // Only use extension if it's after the last slash (in the filename)
+                if (lastDot > lastSlash && lastDot < path.length - 1) {
+                  return path.slice(lastDot + 1).toUpperCase();
+                }
+                return "File";
+              };
+              return {
+                id: `file:${p}`,
+                display: p,
+                description: getFileType(p),
+                replacement: `@${p}`,
+              };
+            });
 
           setAtMentionSuggestions(nextSuggestions);
           setShowAtMentionSuggestions(nextSuggestions.length > 0);
@@ -1096,8 +1113,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         return;
       }
 
+      // Add trailing space so user can continue typing naturally
       const next =
-        input.slice(0, match.startIndex) + suggestion.replacement + input.slice(match.endIndex);
+        input.slice(0, match.startIndex) +
+        suggestion.replacement +
+        " " +
+        input.slice(match.endIndex);
 
       setInput(next);
       setAtMentionSuggestions([]);
@@ -1110,7 +1131,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         }
 
         el.focus();
-        const newCursor = match.startIndex + suggestion.replacement.length;
+        // +1 for the trailing space we added
+        const newCursor = match.startIndex + suggestion.replacement.length + 1;
         el.selectionStart = newCursor;
         el.selectionEnd = newCursor;
       });
@@ -1753,11 +1775,16 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
     // Note: ESC handled by VimTextArea (for mode transitions) and CommandSuggestions (for dismissal)
 
-    // Don't handle keys if suggestions are visible
+    const hasCommandSuggestionMenu = showCommandSuggestions && commandSuggestions.length > 0;
+    const hasAtMentionSuggestionMenu = showAtMentionSuggestions && atMentionSuggestions.length > 0;
+
+    // Don't handle keys if suggestions are visible.
+    //
+    // NOTE: For slash command suggestions, Enter should still submit the command.
+    // For file (@mention) suggestions, Enter accepts the selection.
     if (
-      COMMAND_SUGGESTION_KEYS.includes(e.key) &&
-      ((showCommandSuggestions && commandSuggestions.length > 0) ||
-        (showAtMentionSuggestions && atMentionSuggestions.length > 0))
+      (hasCommandSuggestionMenu && COMMAND_SUGGESTION_KEYS.includes(e.key)) ||
+      (hasAtMentionSuggestionMenu && FILE_SUGGESTION_KEYS.includes(e.key))
     ) {
       return; // Let CommandSuggestions handle it
     }
@@ -1928,6 +1955,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             ariaLabel="File path suggestions"
             listId={atMentionListId}
             anchorRef={variant === "creation" ? inputRef : undefined}
+            highlightQuery={lastAtMentionQueryRef.current ?? ""}
+            isFileSuggestion
           />
 
           {/* Slash command suggestions - available in both variants */}
@@ -1968,9 +1997,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                   onDrop={handleDrop}
                   onEscapeInNormalMode={handleEscapeInNormalMode}
                   suppressKeys={
-                    showCommandSuggestions || showAtMentionSuggestions
-                      ? COMMAND_SUGGESTION_KEYS
-                      : undefined
+                    showAtMentionSuggestions
+                      ? FILE_SUGGESTION_KEYS
+                      : showCommandSuggestions
+                        ? COMMAND_SUGGESTION_KEYS
+                        : undefined
                   }
                   placeholder={placeholder}
                   disabled={!editingMessage && (disabled || isSendInFlight)}
