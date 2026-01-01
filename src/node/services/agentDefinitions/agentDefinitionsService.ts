@@ -26,9 +26,6 @@ import {
   parseAgentDefinitionMarkdown,
 } from "./parseAgentDefinitionMarkdown";
 
-// Re-export the shared inheritance utilities for backend use
-export { agentHasTool, isPlanLike, isExecLike } from "@/common/utils/agentInheritance";
-
 export const MAX_INHERITANCE_DEPTH = 10;
 
 /**

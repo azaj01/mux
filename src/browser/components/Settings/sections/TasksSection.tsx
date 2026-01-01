@@ -30,7 +30,6 @@ import {
 } from "@/common/types/tasks";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import { enforceThinkingPolicy, getThinkingPolicyForModel } from "@/common/utils/thinking/policy";
-import { isPlanLike, resolveAgentTools } from "@/common/utils/agentInheritance";
 
 const INHERIT = "__inherit__";
 const ALL_THINKING_LEVELS = ["off", "low", "medium", "high", "xhigh"] as const;
@@ -108,12 +107,7 @@ function updateAgentDefaultEntry(
   return next;
 }
 
-function renderPolicySummary(
-  agent: AgentDefinitionDescriptor,
-  allAgents: AgentDefinitionDescriptor[]
-): React.ReactNode {
-  // Use proper inheritance check
-  const agentIsPlanLike = isPlanLike(agent.id, allAgents);
+function renderPolicySummary(agent: AgentDefinitionDescriptor): React.ReactNode {
   const isCompact = agent.id === "compact";
 
   const baseDescription = (() => {
@@ -124,16 +118,16 @@ function renderPolicySummary(
       };
     }
 
-    if (agentIsPlanLike) {
+    if (agent.base) {
       return {
-        title: agent.base ? `Base: ${agent.base}` : "Base: plan",
-        note: "Plan-like agents have access to propose_plan.",
+        title: `Base: ${agent.base}`,
+        note: "Inherits prompt/tools from base.",
       };
     }
 
     return {
-      title: agent.base ? `Base: ${agent.base}` : "Base: exec",
-      note: "Exec-like agents cannot use propose_plan.",
+      title: "Base: (none)",
+      note: "No base agent configured.",
     };
   })();
 
@@ -151,25 +145,36 @@ function renderPolicySummary(
     </Tooltip>,
   ];
 
-  // Show resolved tools (after inheritance)
-  const resolvedTools = resolveAgentTools(agent.id, allAgents);
-  if (resolvedTools.length > 0) {
+  const toolAdd = agent.tools?.add ?? [];
+  const toolRemove = agent.tools?.remove ?? [];
+  const toolRuleCount = toolAdd.length + toolRemove.length;
+
+  if (toolRuleCount > 0 || agent.base) {
     pieces.push(
       <Tooltip key="tools">
         <TooltipTrigger asChild>
           <span className="cursor-help underline decoration-dotted underline-offset-2">
-            tools: {resolvedTools.length}
+            {toolRuleCount > 0 ? `tools: ${toolRuleCount}` : "tools: inherited"}
           </span>
         </TooltipTrigger>
         <TooltipContent align="start" className="max-w-80 whitespace-normal">
-          <div className="font-medium">Allowed tools (regex patterns)</div>
-          <ul className="mt-1 space-y-0.5">
-            {resolvedTools.map((tool) => (
-              <li key={tool}>
-                <code>{tool}</code>
-              </li>
-            ))}
-          </ul>
+          <div className="font-medium">Tools</div>
+          {toolRuleCount > 0 ? (
+            <ul className="mt-1 space-y-0.5">
+              {toolAdd.map((pattern) => (
+                <li key={`add:${pattern}`}>
+                  <span className="text-green-500">+</span> <code>{pattern}</code>
+                </li>
+              ))}
+              {toolRemove.map((pattern) => (
+                <li key={`remove:${pattern}`}>
+                  <span className="text-red-500">−</span> <code>{pattern}</code>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <div className="text-muted mt-1 text-xs">Inherited from base.</div>
+          )}
         </TooltipContent>
       </Tooltip>
     );
@@ -480,7 +485,7 @@ export function TasksSection() {
           <div className="min-w-0 flex-1">
             <div className="text-foreground text-sm font-medium">{agent.name}</div>
             <div className="text-muted text-xs">
-              {agent.id} • {scopeNode} • {renderPolicySummary(agent, agents)}
+              {agent.id} • {scopeNode} • {renderPolicySummary(agent)}
               {agent.uiSelectable && agent.subagentRunnable ? (
                 <>
                   {" "}

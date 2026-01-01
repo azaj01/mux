@@ -31,6 +31,7 @@ import {
   discoverAgentDefinitions,
   readAgentDefinition,
 } from "@/node/services/agentDefinitions/agentDefinitionsService";
+import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/resolveAgentInheritanceChain";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 
 /**
@@ -449,7 +450,34 @@ export const router = (authToken?: string) => {
         .output(schemas.agents.list.output)
         .handler(async ({ context, input }) => {
           const { runtime, discoveryPath } = await resolveAgentDiscoveryContext(context, input);
-          return discoverAgentDefinitions(runtime, discoveryPath);
+          const descriptors = await discoverAgentDefinitions(runtime, discoveryPath);
+
+          // Compute derived UI fields that depend on inheritance resolution.
+          // This keeps frontend logic simple and ensures scope rules (same-name overrides)
+          // are applied consistently.
+          return Promise.all(
+            descriptors.map(async (descriptor) => {
+              try {
+                const pkg = await readAgentDefinition(runtime, discoveryPath, descriptor.id);
+                const chain = await resolveAgentInheritanceChain({
+                  runtime,
+                  workspacePath: discoveryPath,
+                  agentId: descriptor.id,
+                  agentDefinition: pkg,
+                  workspaceId: input.workspaceId ?? "", // for logging only
+                });
+
+                const resolvedUiColor = chain.find((entry) => entry.uiColor)?.uiColor;
+
+                return {
+                  ...descriptor,
+                  uiColor: descriptor.uiColor ?? resolvedUiColor,
+                };
+              } catch {
+                return descriptor;
+              }
+            })
+          );
         }),
       get: t
         .input(schemas.agents.get.input)

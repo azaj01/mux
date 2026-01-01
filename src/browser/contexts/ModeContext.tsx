@@ -27,7 +27,6 @@ import {
 } from "@/common/constants/storage";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import type { UIMode } from "@/common/types/mode";
-import { isPlanLike } from "@/common/utils/agentInheritance";
 
 type ModeContextType = [UIMode, (mode: UIMode) => void];
 
@@ -47,10 +46,9 @@ function coerceAgentId(value: unknown): string {
   return typeof value === "string" && value.trim().length > 0 ? value.trim().toLowerCase() : "exec";
 }
 
-function resolveModeFromAgentId(agentId: string, agents: AgentDefinitionDescriptor[]): UIMode {
+function resolveModeFromAgentId(agentId: string): UIMode {
   const normalizedAgentId = coerceAgentId(agentId);
-  // Use proper inheritance check for multi-level support
-  return isPlanLike(normalizedAgentId, agents) ? "plan" : "exec";
+  return normalizedAgentId === "plan" ? "plan" : "exec";
 }
 
 export const ModeProvider: React.FC<ModeProviderProps> = (props) => {
@@ -172,7 +170,7 @@ export const ModeProvider: React.FC<ModeProviderProps> = (props) => {
     }
   }, [fetchAgents, props.projectPath, props.workspaceId, disableWorkspaceAgents]);
 
-  const mode = useMemo(() => resolveModeFromAgentId(agentId, agents), [agentId, agents]);
+  const mode = useMemo(() => resolveModeFromAgentId(agentId), [agentId]);
 
   // Keep legacy mode key in sync so older code paths (and downgrade clients) behave consistently.
   useEffect(() => {
