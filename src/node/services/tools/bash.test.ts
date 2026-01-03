@@ -1385,13 +1385,36 @@ describe("SSH runtime redundant cd detection", () => {
     }
   });
 
-  it("should allow cd to different directory", async () => {
+  it("should not treat cd to a different directory as redundant", () => {
+    // Only testing normalization here - SSH execution would hang (no real host).
     const remoteCwd = "/remote/workspace/project/branch";
-    using testEnv = createTestBashToolWithSSH(remoteCwd);
-    const tool = testEnv.tool;
+
+    const sshRuntime = createRuntime({
+      type: "ssh" as const,
+      host: "test-host",
+      srcBaseDir: "/remote/base",
+    });
+
+    const normalizedTarget = sshRuntime.normalizePath("/tmp", remoteCwd);
+    const normalizedCwd = sshRuntime.normalizePath(".", remoteCwd);
+
+    expect(normalizedTarget).not.toBe(normalizedCwd);
+  });
+});
+
+describe("bash tool - tool_env", () => {
+  it("should source .mux/tool_env before running script", async () => {
+    using tempDir = new TestTempDir("test-bash-tool-env");
+    const muxDir = `${tempDir.path}/.mux`;
+    fs.mkdirSync(muxDir, { recursive: true });
+    fs.writeFileSync(`${muxDir}/tool_env`, "export MUX_TEST_VAR=from_tool_env");
+
+    const config = createTestToolConfig(tempDir.path);
+    config.runtimeTempDir = tempDir.path;
+    const tool = createBashTool(config);
 
     const args: BashToolArgs = {
-      script: "cd /tmp && echo test",
+      script: "echo $MUX_TEST_VAR",
       timeout_secs: 5,
       run_in_background: false,
       display_name: "test",
@@ -1399,15 +1422,56 @@ describe("SSH runtime redundant cd detection", () => {
 
     const result = (await tool.execute!(args, mockToolCallOptions)) as BashToolResult;
 
-    // Should not be blocked (cd to a different directory is allowed)
-    // Note: Test runs locally so actual cd might fail, but we check it's not rejected
-    expect(result.exitCode).not.toBe(-1); // Not a rejection (-1)
-    if (!result.success) {
-      // If it failed, it should not be due to redundant cd detection
-      expect(result.error).not.toContain("Redundant cd");
-    }
+    expect(result.success).toBe(true);
+    expect(result.output).toBe("from_tool_env");
+  });
+
+  it("should fail with clear error if tool_env sourcing fails", async () => {
+    using tempDir = new TestTempDir("test-bash-tool-env-fail");
+    const muxDir = `${tempDir.path}/.mux`;
+    fs.mkdirSync(muxDir, { recursive: true });
+    // Fail `source` without terminating the parent shell.
+    fs.writeFileSync(`${muxDir}/tool_env`, "return 1");
+
+    const config = createTestToolConfig(tempDir.path);
+    config.runtimeTempDir = tempDir.path;
+    const tool = createBashTool(config);
+
+    const args: BashToolArgs = {
+      script: "echo should_not_run",
+      timeout_secs: 5,
+      run_in_background: false,
+      display_name: "test",
+    };
+
+    const result = (await tool.execute!(args, mockToolCallOptions)) as BashToolResult;
+
+    expect(result.success).toBe(false);
+    expect(result.exitCode).toBe(1);
+    expect(result.output).toContain("failed to source");
+  });
+
+  it("should run script normally when no tool_env exists", async () => {
+    using tempDir = new TestTempDir("test-bash-no-tool-env");
+
+    const config = createTestToolConfig(tempDir.path);
+    config.runtimeTempDir = tempDir.path;
+    const tool = createBashTool(config);
+
+    const args: BashToolArgs = {
+      script: "echo normal_execution",
+      timeout_secs: 5,
+      run_in_background: false,
+      display_name: "test",
+    };
+
+    const result = (await tool.execute!(args, mockToolCallOptions)) as BashToolResult;
+
+    expect(result.success).toBe(true);
+    expect(result.output).toBe("normal_execution");
   });
 });
+
 describe("bash tool - background execution", () => {
   it("should reject background mode when manager not available", async () => {
     using testEnv = createTestBashTool();

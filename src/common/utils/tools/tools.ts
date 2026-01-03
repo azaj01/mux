@@ -20,6 +20,7 @@ import { createAgentSkillReadTool } from "@/node/services/tools/agent_skill_read
 import { createAgentSkillReadFileTool } from "@/node/services/tools/agent_skill_read_file";
 import { createAgentReportTool } from "@/node/services/tools/agent_report";
 import { wrapWithInitWait } from "@/node/services/tools/wrapWithInitWait";
+import { withHooks, type HookConfig } from "@/node/services/tools/withHooks";
 import { log } from "@/node/services/log";
 import { attachModelOnlyToolNotifications } from "@/common/utils/tools/internalToolResultFields";
 import { NotificationEngine } from "@/node/services/agentNotifications/NotificationEngine";
@@ -195,6 +196,43 @@ function wrapToolsWithModelOnlyNotifications(
 }
 
 /**
+ * Wrap tools with hook support.
+ *
+ * If any of these exist, each tool execution is wrapped:
+ * - `.mux/tool_pre` (pre-hook)
+ * - `.mux/tool_post` (post-hook)
+ * - `.mux/tool_hook` (legacy pre+post)
+ */
+function wrapToolsWithHooks(
+  tools: Record<string, Tool>,
+  config: ToolConfiguration
+): Record<string, Tool> {
+  // Hooks require workspaceId, cwd, and runtime
+  if (!config.workspaceId || !config.cwd || !config.runtime) {
+    return tools;
+  }
+
+  const hookConfig: HookConfig = {
+    runtime: config.runtime,
+    cwd: config.cwd,
+    runtimeTempDir: config.runtimeTempDir,
+    workspaceId: config.workspaceId,
+    // Match bash tool behavior: muxEnv is present and secrets override it.
+    env: {
+      ...(config.muxEnv ?? {}),
+      ...(config.secrets ?? {}),
+    },
+  };
+
+  const wrappedTools: Record<string, Tool> = {};
+  for (const [toolName, tool] of Object.entries(tools)) {
+    wrappedTools[toolName] = withHooks(toolName, tool, hookConfig);
+  }
+
+  return wrappedTools;
+}
+
+/**
  * Get tools available for a specific model with configuration
  *
  * Providers are lazy-loaded to reduce startup time. AI SDK providers are only
@@ -354,6 +392,10 @@ export async function getToolsForModel(
     finalTools = augmentedTools;
   }
 
+  // Apply hook wrapping first (hooks wrap each tool execution)
+  finalTools = wrapToolsWithHooks(finalTools, config);
+
+  // Then apply model-only notifications (adds notifications to results)
   finalTools = wrapToolsWithModelOnlyNotifications(finalTools, config);
 
   return finalTools;
