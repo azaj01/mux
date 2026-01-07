@@ -10,9 +10,9 @@
 
 </div>
 
-![mux product screenshot](docs/img/product-hero.webp)
-
 A desktop & browser application for parallel agentic development.
+
+![mux product screenshot](docs/img/product-hero.webp)
 
 ## Features
 
