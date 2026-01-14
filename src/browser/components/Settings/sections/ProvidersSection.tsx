@@ -183,11 +183,13 @@ export function ProvidersSection() {
   const [muxGatewayLoginStatus, setMuxGatewayLoginStatus] = useState<MuxGatewayLoginStatus>("idle");
   const [muxGatewayLoginError, setMuxGatewayLoginError] = useState<string | null>(null);
 
+  const muxGatewayApplyDefaultModelsOnSuccessRef = useRef(false);
   const muxGatewayLoginAttemptRef = useRef(0);
   const [muxGatewayDesktopFlowId, setMuxGatewayDesktopFlowId] = useState<string | null>(null);
   const [muxGatewayServerState, setMuxGatewayServerState] = useState<string | null>(null);
 
   const cancelMuxGatewayLogin = () => {
+    muxGatewayApplyDefaultModelsOnSuccessRef.current = false;
     muxGatewayLoginAttemptRef.current++;
 
     if (isDesktop && api && muxGatewayDesktopFlowId) {
@@ -222,6 +224,11 @@ export function ProvidersSection() {
 
   const startMuxGatewayLogin = async () => {
     const attempt = ++muxGatewayLoginAttemptRef.current;
+
+    // Enable Mux Gateway for all eligible models after the *first* successful login.
+    // (If config isn't loaded yet, fall back to the persisted gateway-available state.)
+    const isLoggedIn = config?.["mux-gateway"]?.couponCodeSet ?? gateway.isConfigured;
+    muxGatewayApplyDefaultModelsOnSuccessRef.current = !isLoggedIn;
 
     try {
       setMuxGatewayLoginError(null);
@@ -269,6 +276,22 @@ export function ProvidersSection() {
         }
 
         if (waitResult.success) {
+          if (muxGatewayApplyDefaultModelsOnSuccessRef.current) {
+            let latestConfig = config;
+            try {
+              latestConfig = await api.providers.getConfig();
+            } catch {
+              // Ignore errors fetching config; fall back to the current snapshot.
+            }
+
+            if (attempt !== muxGatewayLoginAttemptRef.current) {
+              return;
+            }
+
+            setGatewayModels(getEligibleGatewayModels(latestConfig));
+            muxGatewayApplyDefaultModelsOnSuccessRef.current = false;
+          }
+
           setMuxGatewayLoginStatus("success");
           return;
         }
@@ -359,6 +382,24 @@ export function ProvidersSection() {
       if (data.state !== muxGatewayServerState) return;
 
       if (data.ok === true) {
+        if (muxGatewayApplyDefaultModelsOnSuccessRef.current) {
+          muxGatewayApplyDefaultModelsOnSuccessRef.current = false;
+
+          const applyLatest = (latestConfig: ProvidersConfigMap | null) => {
+            if (muxGatewayLoginAttemptRef.current !== attempt) return;
+            setGatewayModels(getEligibleGatewayModels(latestConfig));
+          };
+
+          if (api) {
+            api.providers
+              .getConfig()
+              .then(applyLatest)
+              .catch(() => applyLatest(config));
+          } else {
+            applyLatest(config);
+          }
+        }
+
         setMuxGatewayLoginStatus("success");
         return;
       }
@@ -370,7 +411,15 @@ export function ProvidersSection() {
 
     window.addEventListener("message", handleMessage);
     return () => window.removeEventListener("message", handleMessage);
-  }, [isDesktop, muxGatewayLoginStatus, muxGatewayServerState, backendOrigin]);
+  }, [
+    isDesktop,
+    muxGatewayLoginStatus,
+    muxGatewayServerState,
+    backendOrigin,
+    api,
+    config,
+    setGatewayModels,
+  ]);
   const muxGatewayCouponCodeSet = config?.["mux-gateway"]?.couponCodeSet ?? false;
   const muxGatewayLoginInProgress =
     muxGatewayLoginStatus === "waiting" || muxGatewayLoginStatus === "starting";
