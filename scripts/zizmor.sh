@@ -40,11 +40,31 @@ if [[ "${GH_TOKEN:-}" != "" ]]; then
 fi
 
 # Prefer Docker when available (faster + consistent in CI).
+# If docker is present but the image can't be pulled (e.g., GHCR auth/rate limits),
+# fall back to the prebuilt binary.
 if command -v docker &>/dev/null && docker info &>/dev/null; then
-  exec docker run "${docker_args[@]}" "$image_tag" "$@"
-fi
+  set +e
+  docker run "${docker_args[@]}" "$image_tag" "$@"
+  status=$?
+  set -e
 
-echo "⚠️  Docker unavailable; running zizmor via prebuilt binary..."
+  if [[ $status -eq 0 ]]; then
+    exit 0
+  fi
+
+  # Exit code 125 indicates the docker invocation failed (image pull, daemon issues, etc.).
+  # Only in that case do we fall back to the prebuilt binary.
+  #
+  # For other non-zero exit codes, zizmor itself failed (e.g., it found issues) and we should
+  # propagate that failure rather than masking it.
+  if [[ $status -ne 125 ]]; then
+    exit $status
+  fi
+
+  echo "⚠️  Docker zizmor failed (exit $status); running prebuilt binary..."
+else
+  echo "⚠️  Docker unavailable; running zizmor via prebuilt binary..."
+fi
 
 os="$(uname -s)"
 arch="$(uname -m)"
