@@ -656,6 +656,7 @@ export class AgentSession {
         "exec";
       // Build options for the queued message (strip compaction-specific fields)
       // agentId determines tool policy via resolveToolPolicyForAgent in aiService
+
       const sanitizedOptions: Omit<
         SendMessageOptions,
         "muxMetadata" | "mode" | "editMessageId" | "imageParts" | "maxOutputTokens"
@@ -680,8 +681,14 @@ export class AgentSession {
         sanitizedOptions.muxMetadata = metadata;
       }
 
-      this.messageQueue.add(finalText, sanitizedOptions);
-      this.emitQueuedMessageChanged();
+      const dedupeKey = JSON.stringify({
+        text: finalText.trim(),
+        images: (continueImageParts ?? []).map((image) => `${image.mediaType}:${image.url}`),
+      });
+
+      if (this.messageQueue.addOnce(finalText, sanitizedOptions, dedupeKey)) {
+        this.emitQueuedMessageChanged();
+      }
     }
 
     if (this.disposed) {
@@ -925,11 +932,16 @@ export class AgentSession {
     error: string;
     errorType?: string;
   }): Promise<void> {
+    const hadCompactionRequest = this.activeCompactionRequest !== undefined;
     if (await this.maybeRetryCompactionOnContextExceeded(data)) {
       return;
     }
 
     this.activeCompactionRequest = undefined;
+
+    if (hadCompactionRequest && !this.disposed) {
+      this.clearQueue();
+    }
 
     const streamError: StreamErrorMessage = {
       type: "stream-error",
@@ -984,7 +996,11 @@ export class AgentSession {
     forward("reasoning-end", (payload) => this.emitChatEvent(payload));
     forward("usage-delta", (payload) => this.emitChatEvent(payload));
     forward("stream-abort", (payload) => {
+      const hadCompactionRequest = this.activeCompactionRequest !== undefined;
       this.activeCompactionRequest = undefined;
+      if (hadCompactionRequest && !this.disposed) {
+        this.clearQueue();
+      }
       this.emitChatEvent(payload);
     });
     forward("runtime-status", (payload) => this.emitChatEvent(payload));
@@ -992,6 +1008,7 @@ export class AgentSession {
     forward("stream-end", async (payload) => {
       this.activeCompactionRequest = undefined;
       const handled = await this.compactionHandler.handleCompletion(payload as StreamEndEvent);
+
       if (!handled) {
         this.emitChatEvent(payload);
       } else {
@@ -999,6 +1016,7 @@ export class AgentSession {
         // This allows the frontend to get updated postCompaction state
         this.onCompactionComplete?.();
       }
+
       // Stream end: auto-send queued messages
       this.sendQueuedMessages();
     });
