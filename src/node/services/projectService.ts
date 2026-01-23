@@ -9,6 +9,7 @@ import { listLocalBranches, detectDefaultTrunkBranch } from "@/node/git";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
 import type { Secret } from "@/common/types/secrets";
+import type { Stats } from "fs";
 import * as fsPromises from "fs/promises";
 import { execAsync } from "@/node/utils/disposableExec";
 import {
@@ -21,7 +22,8 @@ import { log } from "@/node/services/log";
 import type { BranchListResult } from "@/common/orpc/types";
 import type { FileTreeNode } from "@/common/utils/git/numstatParser";
 import * as path from "path";
-import * as os from "os";
+import { getMuxProjectsDir } from "@/common/constants/paths";
+import { expandTilde } from "@/node/runtime/tildeExpansion";
 
 /**
  * List directory contents for the DirectoryPickerModal.
@@ -32,8 +34,8 @@ import * as os from "os";
 async function listDirectory(requestedPath: string): Promise<FileTreeNode> {
   // Expand ~ to home directory (path.resolve doesn't handle tilde)
   const expanded =
-    requestedPath === "~" || requestedPath.startsWith("~/")
-      ? requestedPath.replace("~", os.homedir())
+    requestedPath === "~" || requestedPath.startsWith("~/") || requestedPath.startsWith("~\\")
+      ? expandTilde(requestedPath)
       : requestedPath;
   const normalizedRoot = path.resolve(expanded || ".");
   const entries = await fsPromises.readdir(normalizedRoot, { withFileTypes: true });
@@ -85,17 +87,58 @@ export class ProjectService {
     projectPath: string
   ): Promise<Result<{ projectConfig: ProjectConfig; normalizedPath: string }>> {
     try {
-      const validation = await validateProjectPath(projectPath);
-      if (!validation.valid) {
-        return Err(validation.error ?? "Invalid project path");
+      // Validate input
+      if (!projectPath || projectPath.trim().length === 0) {
+        return Err("Project path cannot be empty");
       }
 
-      const normalizedPath = validation.expandedPath!;
+      // Resolve the path:
+      // - Bare names like "my-project" → ~/.mux/projects/my-project
+      // - Paths with ~ → expand to home directory
+      // - Absolute/relative paths → resolve normally
+      const isBareProjectName =
+        projectPath.length > 0 &&
+        !projectPath.includes("/") &&
+        !projectPath.includes("\\") &&
+        !projectPath.startsWith("~");
+
+      let normalizedPath: string;
+      if (isBareProjectName) {
+        // Bare project name - put in default projects directory
+        normalizedPath = path.join(getMuxProjectsDir(), projectPath);
+      } else if (
+        projectPath === "~" ||
+        projectPath.startsWith("~/") ||
+        projectPath.startsWith("~\\")
+      ) {
+        // Tilde expansion - uses expandTilde to respect MUX_ROOT for ~/.mux paths
+        normalizedPath = path.resolve(expandTilde(projectPath));
+      } else {
+        normalizedPath = path.resolve(projectPath);
+      }
+
+      let existingStat: Stats | null = null;
+      try {
+        existingStat = await fsPromises.stat(normalizedPath);
+      } catch (error) {
+        const err = error as NodeJS.ErrnoException;
+        if (err.code !== "ENOENT") {
+          throw error;
+        }
+      }
+
+      if (existingStat && !existingStat.isDirectory()) {
+        return Err("Project path is not a directory");
+      }
+
       const config = this.config.loadConfigOrDefault();
 
       if (config.projects.has(normalizedPath)) {
         return Err("Project already exists");
       }
+
+      // Create the directory if it doesn't exist (like mkdir -p)
+      await fsPromises.mkdir(normalizedPath, { recursive: true });
 
       const projectConfig: ProjectConfig = { workspaces: [] };
       config.projects.set(normalizedPath, projectConfig);
@@ -326,8 +369,8 @@ export class ProjectService {
     try {
       // Expand ~ to home directory
       const expanded =
-        requestedPath === "~" || requestedPath.startsWith("~/")
-          ? requestedPath.replace("~", os.homedir())
+        requestedPath === "~" || requestedPath.startsWith("~/") || requestedPath.startsWith("~\\")
+          ? expandTilde(requestedPath)
           : requestedPath;
       const normalizedPath = path.resolve(expanded);
 
