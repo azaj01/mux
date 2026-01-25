@@ -608,6 +608,7 @@ export class SessionTimingService {
   // --- Stream event handlers (wired from AIService) ---
 
   handleStreamStart(data: StreamStartEvent): void {
+    if (data.replay === true) return;
     if (!this.isEnabled()) return;
 
     assert(typeof data.workspaceId === "string" && data.workspaceId.length > 0);
@@ -643,6 +644,7 @@ export class SessionTimingService {
   }
 
   handleStreamDelta(data: StreamDeltaEvent): void {
+    if (data.replay === true) return;
     const state = this.activeStreams.get(data.workspaceId);
     if (!state) return;
 
@@ -660,6 +662,7 @@ export class SessionTimingService {
   }
 
   handleReasoningDelta(data: ReasoningDeltaEvent): void {
+    if (data.replay === true) return;
     const state = this.activeStreams.get(data.workspaceId);
     if (!state) return;
 
@@ -681,6 +684,7 @@ export class SessionTimingService {
   }
 
   handleToolCallStart(data: ToolCallStartEvent): void {
+    if (data.replay === true) return;
     const state = this.activeStreams.get(data.workspaceId);
     if (!state) return;
 
@@ -717,6 +721,7 @@ export class SessionTimingService {
   }
 
   handleToolCallDelta(data: ToolCallDeltaEvent): void {
+    if (data.replay === true) return;
     const state = this.activeStreams.get(data.workspaceId);
     if (!state) return;
 
@@ -731,6 +736,7 @@ export class SessionTimingService {
   }
 
   handleToolCallEnd(data: ToolCallEndEvent): void {
+    if (data.replay === true) return;
     const state = this.activeStreams.get(data.workspaceId);
     if (!state) return;
 
