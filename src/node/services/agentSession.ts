@@ -40,10 +40,11 @@ import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import {
   createMuxMessage,
   prepareUserMessageForSend,
-  type ContinueMessage,
+  type CompactionFollowUpRequest,
   type MuxFrontendMetadata,
   type MuxImagePart,
   type MuxMessage,
+  type ReviewNoteDataForDisplay,
 } from "@/common/types/message";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
@@ -70,10 +71,21 @@ import { materializeFileAtMentions } from "@/node/services/fileAtMentions";
 export type { FileState, EditedFileAttachment } from "@/node/services/utils/fileChangeTracker";
 
 // Type guard for compaction request metadata
+// Supports both new `followUpContent` and legacy `continueMessage` for backwards compatibility
 interface CompactionRequestMetadata {
   type: "compaction-request";
   parsed: {
-    continueMessage?: ContinueMessage;
+    followUpContent?: CompactionFollowUpRequest;
+    // Legacy field - older persisted requests may use this instead of followUpContent
+    continueMessage?: {
+      text?: string;
+      imageParts?: ImagePart[];
+      reviews?: ReviewNoteDataForDisplay[];
+      muxMetadata?: MuxFrontendMetadata;
+      model?: string;
+      agentId?: string;
+      mode?: "exec" | "plan"; // Legacy: older versions stored mode instead of agentId
+    };
   };
 }
 
@@ -632,62 +644,73 @@ export class AgentSession {
         }
       }
 
-      // If this is a compaction request with a continue message, queue it for auto-send after compaction
-      if (isCompactionRequest && typedMuxMetadata.parsed.continueMessage && options) {
-        const continueMessage = typedMuxMetadata.parsed.continueMessage;
+      // If this is a compaction request with follow-up content, queue it for auto-send after compaction
+      // Use the type guard result to access followUpContent with proper typing
+      // Supports both new `followUpContent` and legacy `continueMessage` for backwards compatibility
+      if (isCompactionRequest && typedMuxMetadata && options) {
+        const compactionMeta = typedMuxMetadata as CompactionRequestMetadata;
+        // Prefer new field, fall back to legacy
+        const rawFollowUp =
+          compactionMeta.parsed.followUpContent ?? compactionMeta.parsed.continueMessage;
 
-        // Process the continue message content (handles reviews -> text formatting + metadata)
-        const { finalText, metadata } = prepareUserMessageForSend(
-          continueMessage,
-          continueMessage.muxMetadata
-        );
+        if (rawFollowUp) {
+          // Normalize to ensure text is always a string (legacy format may have undefined)
+          const followUpContent = {
+            ...rawFollowUp,
+            text: rawFollowUp.text ?? "",
+          };
 
-        // Legacy compatibility: older clients stored `continueMessage.mode` (exec/plan) and compaction
-        // requests run with agentId="compact". Avoid falling back to the compact agent for the
-        // post-compaction follow-up.
-        const legacyMode = (continueMessage as { mode?: unknown }).mode;
-        const legacyAgentId =
-          legacyMode === "plan" || legacyMode === "exec" ? legacyMode : undefined;
+          // Process the follow-up content (handles reviews -> text formatting + metadata)
+          const { finalText, metadata } = prepareUserMessageForSend(
+            followUpContent,
+            followUpContent.muxMetadata
+          );
 
-        const fallbackAgentId =
-          continueMessage.agentId ??
-          legacyAgentId ??
-          (options.agentId && options.agentId !== "compact" ? options.agentId : undefined) ??
-          "exec";
-        // Build options for the queued message (strip compaction-specific fields)
-        // agentId determines tool policy via resolveToolPolicyForAgent in aiService
+          // Derive agentId: new field has it directly, legacy may use `mode` field
+          // Legacy `mode` was "exec" | "plan" and maps directly to agentId
+          const legacyMode =
+            "mode" in followUpContent && typeof followUpContent.mode === "string"
+              ? followUpContent.mode
+              : undefined;
+          const effectiveAgentId = followUpContent.agentId ?? legacyMode ?? "exec";
 
-        const sanitizedOptions: Omit<
-          SendMessageOptions,
-          "muxMetadata" | "mode" | "editMessageId" | "imageParts" | "maxOutputTokens"
-        > & { imageParts?: typeof continueMessage.imageParts; muxMetadata?: typeof metadata } = {
-          model: continueMessage.model ?? options.model,
-          agentId: fallbackAgentId,
-          thinkingLevel: options.thinkingLevel,
-          additionalSystemInstructions: options.additionalSystemInstructions,
-          providerOptions: options.providerOptions,
-          experiments: options.experiments,
-          disableWorkspaceAgents: options.disableWorkspaceAgents,
-        };
+          // Use model/agentId from followUpContent - these were captured from the user's
+          // original settings when compaction was triggered (compaction uses its own
+          // agentId "compact" and potentially a different model for summarization).
+          // Build options for the queued message (strip compaction-specific fields)
+          // agentId determines tool policy via resolveToolPolicyForAgent in aiService
+          const sanitizedOptions: Omit<
+            SendMessageOptions,
+            "muxMetadata" | "mode" | "editMessageId" | "imageParts" | "maxOutputTokens"
+          > & { imageParts?: ImagePart[]; muxMetadata?: MuxFrontendMetadata } = {
+            model: followUpContent.model ?? options.model,
+            agentId: effectiveAgentId,
+            thinkingLevel: options.thinkingLevel,
+            additionalSystemInstructions: options.additionalSystemInstructions,
+            providerOptions: options.providerOptions,
+            experiments: options.experiments,
+            disableWorkspaceAgents: options.disableWorkspaceAgents,
+          };
 
-        // Add image parts if present
-        const continueImageParts = continueMessage.imageParts;
-        if (continueImageParts && continueImageParts.length > 0) {
-          sanitizedOptions.imageParts = continueImageParts;
-        }
+          // Add image parts if present
+          const imageParts = followUpContent.imageParts;
+          if (imageParts && imageParts.length > 0) {
+            sanitizedOptions.imageParts = imageParts;
+          }
 
-        // Add metadata with reviews if present
-        if (metadata) {
-          sanitizedOptions.muxMetadata = metadata;
-        }
+          // Add metadata with reviews if present
+          if (metadata) {
+            sanitizedOptions.muxMetadata = metadata;
+          }
 
-        const dedupeKey = JSON.stringify({
-          text: finalText.trim(),
-          images: (continueImageParts ?? []).map((image) => `${image.mediaType}:${image.url}`),
-        });
+          const dedupeKey = JSON.stringify({
+            text: finalText.trim(),
+            images: (imageParts ?? []).map((image) => `${image.mediaType}:${image.url}`),
+          });
 
-        if (this.messageQueue.addOnce(finalText, sanitizedOptions, dedupeKey)) {
-          this.emitQueuedMessageChanged();
+          if (this.messageQueue.addOnce(finalText, sanitizedOptions, dedupeKey)) {
+            this.emitQueuedMessageChanged();
+          }
         }
       }
 

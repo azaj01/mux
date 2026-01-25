@@ -4,6 +4,7 @@ import type {
   MuxImagePart,
   DisplayedMessage,
   CompactionRequestData,
+  CompactionFollowUpRequest,
   MuxFrontendMetadata,
 } from "@/common/types/message";
 import { createMuxMessage } from "@/common/types/message";
@@ -40,7 +41,7 @@ import { createDeltaStorage, type DeltaRecordStorage } from "./StreamingTPSCalcu
 import { computeRecencyTimestamp } from "./recency";
 import { assert } from "@/common/utils/assert";
 import { getStatusStateKey } from "@/common/constants/storage";
-import { getCompactionContinueText } from "@/browser/utils/compaction/format";
+import { getFollowUpContentText } from "@/browser/utils/compaction/format";
 
 // Maximum number of messages to display in the DOM for performance
 // Full history is still maintained internally for token counting and stats
@@ -1123,7 +1124,7 @@ export class StreamingMessageAggregator {
     const isCompacting = data.mode === "compact" || compactionRequest !== null;
 
     // Capture compaction-continue metadata before clearing pending request state.
-    const hasCompactionContinue = Boolean(compactionRequest?.continueMessage);
+    const hasCompactionContinue = Boolean(compactionRequest?.followUpContent);
 
     // Clear pending stream start timestamp - stream has started
     this.setPendingStreamStartTime(null);
@@ -1813,25 +1814,33 @@ export class StreamingMessageAggregator {
           ? { skillName: muxMeta.skillName, scope: muxMeta.scope }
           : undefined;
 
+      // Extract followUpContent, supporting both new `followUpContent` and legacy `continueMessage` fields
+      const extractFollowUpContent = (): CompactionFollowUpRequest | undefined => {
+        if (muxMeta?.type !== "compaction-request") return undefined;
+        const parsed = muxMeta.parsed as {
+          followUpContent?: CompactionFollowUpRequest;
+          continueMessage?: CompactionFollowUpRequest;
+        };
+        return parsed.followUpContent ?? parsed.continueMessage;
+      };
+      const compactionFollowUp = extractFollowUpContent();
+
       const compactionRequest =
         muxMeta?.type === "compaction-request"
           ? {
               parsed: {
                 model: muxMeta.parsed.model,
                 maxOutputTokens: muxMeta.parsed.maxOutputTokens,
-                continueMessage: muxMeta.parsed.continueMessage,
+                followUpContent: compactionFollowUp,
               } satisfies CompactionRequestData,
             }
           : undefined;
 
-      // LEGACY COMPAT: For compaction messages created before commandPrefix was stored,
-      // rawCommand only contained the command line while the continue payload lived in
-      // parsed.continueMessage. Reconstruct the full content here for display/edit.
-      // This code path can be removed once all users have upgraded past this change.
-      if (rawCommand && compactionRequest?.parsed.continueMessage && !rawCommand.includes("\n")) {
-        const continueText = getCompactionContinueText(compactionRequest.parsed.continueMessage);
-        if (continueText) {
-          rawCommand = `${rawCommand}\n${continueText}`;
+      // Reconstruct full rawCommand if follow-up text isn't already included
+      if (rawCommand && compactionRequest?.parsed.followUpContent && !rawCommand.includes("\n")) {
+        const followUpText = getFollowUpContentText(compactionRequest.parsed.followUpContent);
+        if (followUpText) {
+          rawCommand = `${rawCommand}\n${followUpText}`;
         }
       }
 

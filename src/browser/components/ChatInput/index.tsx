@@ -22,7 +22,7 @@ import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useAgent } from "@/browser/contexts/AgentContext";
 import { ThinkingSliderComponent } from "../ThinkingSlider";
 import { ModelSettings } from "../ModelSettings";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, type APIClient } from "@/browser/contexts/API";
 import { useThinkingLevel } from "@/browser/hooks/useThinkingLevel";
 import { migrateGatewayModel } from "@/browser/hooks/useGatewayModels";
 import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
@@ -46,7 +46,6 @@ import {
   forkWorkspace,
   prepareCompactionMessage,
   executeCompaction,
-  buildContinueMessage,
   type CommandHandlerContext,
 } from "@/browser/utils/chatCommands";
 import { shouldTriggerAutoCompaction } from "@/browser/utils/compaction/shouldTriggerAutoCompaction";
@@ -87,8 +86,11 @@ import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { ParsedRuntime } from "@/common/types/runtime";
 import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
-import type { MuxFrontendMetadata } from "@/common/types/message";
-import { prepareUserMessageForSend } from "@/common/types/message";
+import {
+  buildAgentSkillMetadata,
+  type MuxFrontendMetadata,
+  prepareUserMessageForSend,
+} from "@/common/types/message";
 import { MODEL_ABBREVIATION_EXAMPLES } from "@/common/constants/knownModels";
 import { useTelemetry } from "@/browser/hooks/useTelemetry";
 
@@ -129,6 +131,100 @@ type CreationRuntimeValidationError =
   | { mode: "ssh"; kind: "missingCoderTemplate" }
   | { mode: "ssh"; kind: "missingCoderPreset" };
 
+interface SkillInvocation {
+  descriptor: AgentSkillDescriptor;
+  userText: string;
+}
+
+type SkillResolutionTarget =
+  | { kind: "project"; projectPath: string }
+  | { kind: "workspace"; workspaceId: string; disableWorkspaceAgents?: boolean };
+
+function buildSkillInvocationMetadata(
+  rawCommand: string,
+  descriptor: AgentSkillDescriptor
+): MuxFrontendMetadata {
+  return buildAgentSkillMetadata({
+    rawCommand,
+    commandPrefix: `/${descriptor.name}`,
+    skillName: descriptor.name,
+    scope: descriptor.scope,
+  });
+}
+
+async function resolveSkillInvocation(options: {
+  messageText: string;
+  parsed: ParsedCommand;
+  agentSkillDescriptors: AgentSkillDescriptor[];
+  api: APIClient | null;
+  discovery: SkillResolutionTarget | null;
+}): Promise<SkillInvocation | null> {
+  if (!isUnknownSlashCommand(options.parsed)) {
+    return null;
+  }
+
+  const command = options.parsed.command;
+  const prefix = `/${command}`;
+  const afterPrefix = options.messageText.slice(prefix.length);
+  const hasSeparator = afterPrefix.length === 0 || /^\s/.test(afterPrefix);
+
+  if (!hasSeparator) {
+    return null;
+  }
+
+  let skill: AgentSkillDescriptor | undefined = options.agentSkillDescriptors.find(
+    (candidate) => candidate.name === command
+  );
+
+  if (!skill && options.api && options.discovery) {
+    try {
+      const pkg =
+        options.discovery.kind === "project"
+          ? await options.api.agentSkills.get({
+              projectPath: options.discovery.projectPath,
+              skillName: command,
+            })
+          : await options.api.agentSkills.get({
+              workspaceId: options.discovery.workspaceId,
+              disableWorkspaceAgents: options.discovery.disableWorkspaceAgents,
+              skillName: command,
+            });
+      skill = {
+        name: pkg.frontmatter.name,
+        description: pkg.frontmatter.description,
+        scope: pkg.scope,
+      };
+    } catch {
+      // Not a skill (or not available yet) - fall through.
+    }
+  }
+
+  if (!skill) {
+    return null;
+  }
+
+  return {
+    descriptor: skill,
+    userText: formatSkillInvocationText(skill.name, afterPrefix.trimStart()),
+  };
+}
+async function parseCommandWithSkillInvocation(options: {
+  messageText: string;
+  agentSkillDescriptors: AgentSkillDescriptor[];
+  api: APIClient | null;
+  discovery: SkillResolutionTarget | null;
+}): Promise<{ parsed: ParsedCommand; skillInvocation: SkillInvocation | null }> {
+  const parsed = parseCommand(options.messageText);
+  const skillInvocation = await resolveSkillInvocation({
+    messageText: options.messageText,
+    parsed,
+    agentSkillDescriptors: options.agentSkillDescriptors,
+    api: options.api,
+    discovery: options.discovery,
+  });
+
+  return { parsed: skillInvocation ? null : parsed, skillInvocation };
+}
 /**
  * Format user message text for skill invocation.
  * Makes it explicit to the model that a skill was invoked.
@@ -1406,67 +1502,46 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     }
 
     const messageText = input.trim();
+    const skillDiscovery: SkillResolutionTarget | null =
+      variant === "creation"
+        ? atMentionProjectPath
+          ? { kind: "project", projectPath: atMentionProjectPath }
+          : null
+        : variant === "workspace" && workspaceId
+          ? {
+              kind: "workspace",
+              workspaceId,
+              disableWorkspaceAgents: sendMessageOptions.disableWorkspaceAgents,
+            }
+          : null;
+    const { parsed, skillInvocation } = await parseCommandWithSkillInvocation({
+      messageText,
+      agentSkillDescriptors,
+      api,
+      discovery: skillDiscovery,
+    });
 
     // Route to creation handler for creation variant
     if (variant === "creation") {
       let creationMessageTextForSend = messageText;
       let creationOptionsOverride: Partial<SendMessageOptions> | undefined;
 
-      if (messageText.startsWith("/")) {
-        const parsed = parseCommand(messageText);
-
-        if (isUnknownSlashCommand(parsed)) {
-          const command = parsed.command;
-          const prefix = `/${command}`;
-          const afterPrefix = messageText.slice(prefix.length);
-          const hasSeparator = afterPrefix.length === 0 || /^\s/.test(afterPrefix);
-
-          if (hasSeparator) {
-            let skill: AgentSkillDescriptor | undefined = agentSkillDescriptors.find(
-              (candidate) => candidate.name === command
-            );
-
-            if (!skill && api && atMentionProjectPath) {
-              try {
-                const pkg = await api.agentSkills.get({
-                  projectPath: atMentionProjectPath,
-                  skillName: command,
-                });
-                skill = {
-                  name: pkg.frontmatter.name,
-                  description: pkg.frontmatter.description,
-                  scope: pkg.scope,
-                };
-              } catch {
-                // Not a skill (or not available yet) - fall through.
-              }
-            }
-
-            if (skill) {
-              const userText = formatSkillInvocationText(skill.name, afterPrefix.trimStart());
-
-              if (!api) {
-                pushToast({ type: "error", message: "Not connected to server" });
-                return;
-              }
-
-              creationMessageTextForSend = userText;
-              creationOptionsOverride = {
-                muxMetadata: {
-                  type: "agent-skill",
-                  rawCommand: messageText,
-                  commandPrefix: `/${skill.name}`,
-                  skillName: skill.name,
-                  scope: skill.scope,
-                },
-                // In the creation flow, skills are discovered from the project path. If the skill is
-                // project-scoped (often untracked in git), it may not exist in the new worktree.
-                // Force project-path discovery for this send so resolution matches suggestions.
-                ...(skill.scope === "project" ? { disableWorkspaceAgents: true } : {}),
-              };
-            }
-          }
+      if (skillInvocation) {
+        if (!api) {
+          pushToast({ type: "error", message: "Not connected to server" });
+          return;
         }
+
+        creationMessageTextForSend = skillInvocation.userText;
+        creationOptionsOverride = {
+          muxMetadata: buildSkillInvocationMetadata(messageText, skillInvocation.descriptor),
+          // In the creation flow, skills are discovered from the project path. If the skill is
+          // project-scoped (often untracked in git), it may not exist in the new worktree.
+          // Force project-path discovery for this send so resolution matches suggestions.
+          ...(skillInvocation.descriptor.scope === "project"
+            ? { disableWorkspaceAgents: true }
+            : {}),
+        };
       }
 
       setHasAttemptedCreateSend(true);
@@ -1502,48 +1577,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     if (variant !== "workspace") return; // Type guard
 
     try {
-      // Parse command
-      let parsed = parseCommand(messageText);
-
-      let skillInvocation: { descriptor: AgentSkillDescriptor; userText: string } | null = null;
-
-      if (isUnknownSlashCommand(parsed)) {
-        const command = parsed.command;
-        const prefix = `/${command}`;
-        const afterPrefix = messageText.slice(prefix.length);
-        const hasSeparator = afterPrefix.length === 0 || /^\s/.test(afterPrefix);
-
-        if (hasSeparator) {
-          let skill: AgentSkillDescriptor | undefined = agentSkillDescriptors.find(
-            (candidate) => candidate.name === command
-          );
-
-          if (!skill && api && workspaceId) {
-            try {
-              const pkg = await api.agentSkills.get({
-                workspaceId,
-                disableWorkspaceAgents: sendMessageOptions.disableWorkspaceAgents,
-                skillName: command,
-              });
-              skill = {
-                name: pkg.frontmatter.name,
-                description: pkg.frontmatter.description,
-                scope: pkg.scope,
-              };
-            } catch {
-              // Not a skill (or not available yet) - fall through.
-            }
-          }
-
-          if (skill) {
-            const userText = formatSkillInvocationText(skill.name, afterPrefix.trimStart());
-
-            skillInvocation = { descriptor: skill, userText };
-            parsed = null;
-          }
-        }
-      }
-
       if (parsed) {
         // Handle /clear command - show confirmation modal
         if (parsed.type === "clear") {
@@ -1826,6 +1859,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
       // Regular message - send directly via API
       const messageTextForSend = skillInvocation?.userText ?? messageText;
+      const skillMuxMetadata = skillInvocation
+        ? buildSkillInvocationMetadata(messageText, skillInvocation.descriptor)
+        : undefined;
 
       if (!api) {
         pushToast({ type: "error", message: "Not connected to server" });
@@ -1875,22 +1911,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           const result = await executeCompaction({
             api,
             workspaceId: props.workspaceId,
-            continueMessage: buildContinueMessage({
+            followUpContent: {
               text: messageTextForSend,
               imageParts,
               reviews: reviewsData,
-              muxMetadata: skillInvocation
-                ? {
-                    type: "agent-skill",
-                    rawCommand: messageText,
-                    commandPrefix: `/${skillInvocation.descriptor.name}`,
-                    skillName: skillInvocation.descriptor.name,
-                    scope: skillInvocation.descriptor.scope,
-                  }
-                : undefined,
-              model: sendMessageOptions.model,
-              agentId: sendMessageOptions.agentId ?? "exec",
-            }),
+              muxMetadata: skillMuxMetadata,
+            },
             sendMessageOptions: compactionSendMessageOptions,
           });
 
@@ -1945,15 +1971,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
         // When editing a /compact command, regenerate the actual summarization request
         let actualMessageText = messageTextForSend;
-        let muxMetadata: MuxFrontendMetadata | undefined = skillInvocation
-          ? {
-              type: "agent-skill",
-              rawCommand: messageText,
-              commandPrefix: `/${skillInvocation.descriptor.name}`,
-              skillName: skillInvocation.descriptor.name,
-              scope: skillInvocation.descriptor.scope,
-            }
-          : undefined;
+        let muxMetadata: MuxFrontendMetadata | undefined = skillMuxMetadata;
         let compactionOptions: Partial<SendMessageOptions> = {};
 
         if (editingMessage && actualMessageText.startsWith("/")) {
@@ -1967,15 +1985,16 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
               api,
               workspaceId: props.workspaceId,
               maxOutputTokens: parsed.maxOutputTokens,
-              // Include current attachments (images, reviews) in continueMessage so they're
-              // queued after compaction completes, not just attached to the compaction request
-              continueMessage: buildContinueMessage({
-                text: parsed.continueMessage,
-                imageParts,
-                reviews: reviewsData,
-                model: sendMessageOptions.model,
-                agentId: sendMessageOptions.agentId ?? "exec",
-              }),
+              // Include current attachments (images, reviews) in followUpContent so they're
+              // queued after compaction completes, not just attached to the compaction request.
+              followUpContent:
+                parsed.continueMessage || imageParts?.length || reviewsData?.length
+                  ? {
+                      text: parsed.continueMessage ?? "",
+                      imageParts,
+                      reviews: reviewsData,
+                    }
+                  : undefined,
               model: parsed.model,
               sendMessageOptions,
             });
