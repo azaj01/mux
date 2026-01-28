@@ -7,7 +7,12 @@ import { useTheme } from "@/browser/contexts/ThemeContext";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useWorkspaceUnread } from "@/browser/hooks/useWorkspaceUnread";
-import { EXPANDED_PROJECTS_KEY } from "@/common/constants/storage";
+import {
+  EXPANDED_PROJECTS_KEY,
+  getDraftScopeId,
+  getInputKey,
+  getWorkspaceNameStateKey,
+} from "@/common/constants/storage";
 import { DndProvider } from "react-dnd";
 import { HTML5Backend, getEmptyImage } from "react-dnd-html5-backend";
 import { useDrag, useDrop, useDragLayer } from "react-dnd";
@@ -39,9 +44,10 @@ import { WorkspaceListItem, type WorkspaceSelection } from "./WorkspaceListItem"
 import { WorkspaceStatusIndicator } from "./WorkspaceStatusIndicator";
 import { RenameProvider } from "@/browser/contexts/WorkspaceRenameContext";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
-import { ChevronRight, CircleHelp, KeyRound } from "lucide-react";
+import { ChevronRight, CircleHelp, KeyRound, Trash2 } from "lucide-react";
 import { MUX_HELP_CHAT_WORKSPACE_ID } from "@/common/constants/muxChat";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
+import { useRouter } from "@/browser/contexts/RouterContext";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { PopoverError } from "./PopoverError";
 import { SectionHeader } from "./SectionHeader";
@@ -178,6 +184,102 @@ const DraggableProjectItem = React.memo(
     prev.onReorder === next.onReorder &&
     (prev["aria-expanded"] ?? false) === (next["aria-expanded"] ?? false)
 );
+interface DraftWorkspaceListItemProps {
+  projectPath: string;
+  draftId: string;
+  draftNumber: number;
+  isSelected: boolean;
+  onOpen: () => void;
+  onDelete: () => void;
+}
+
+function DraftWorkspaceListItem(props: DraftWorkspaceListItemProps) {
+  const scopeId = getDraftScopeId(props.projectPath, props.draftId);
+
+  const [draftPrompt] = usePersistedState<string>(getInputKey(scopeId), "", {
+    listener: true,
+  });
+
+  const [workspaceNameState] = usePersistedState<unknown>(getWorkspaceNameStateKey(scopeId), null, {
+    listener: true,
+  });
+
+  const workspaceName = (() => {
+    if (!workspaceNameState || typeof workspaceNameState !== "object") {
+      return "";
+    }
+
+    const record = workspaceNameState as Record<string, unknown>;
+    const autoGenerate = record.autoGenerate !== false;
+
+    if (autoGenerate) {
+      const generatedIdentity = record.generatedIdentity;
+      if (!generatedIdentity || typeof generatedIdentity !== "object") {
+        return "";
+      }
+
+      const generatedRecord = generatedIdentity as Record<string, unknown>;
+      return typeof generatedRecord.name === "string" ? generatedRecord.name : "";
+    }
+
+    return typeof record.manualName === "string" ? record.manualName : "";
+  })();
+
+  // Collapse whitespace so multi-line prompts show up nicely as a single-line preview.
+  const promptPreview =
+    typeof draftPrompt === "string" ? draftPrompt.trim().replace(/\s+/g, " ") : "";
+
+  const titleText = workspaceName.trim().length > 0 ? workspaceName.trim() : "Draft";
+
+  return (
+    <div
+      className={cn(
+        "py-1.5 pr-2 border-l-[3px] border-transparent transition-all duration-150 text-[13px] relative flex gap-2",
+        "cursor-pointer hover:bg-hover [&:hover_button]:opacity-100",
+        props.isSelected && "bg-hover border-l-blue-400"
+      )}
+      style={{ paddingLeft: 9 }}
+      onClick={props.onOpen}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          props.onOpen();
+        }
+      }}
+      role="button"
+      tabIndex={0}
+      aria-current={props.isSelected ? "true" : undefined}
+      aria-label={`Open workspace draft ${props.draftNumber}`}
+      data-project-path={props.projectPath}
+      data-draft-id={props.draftId}
+    >
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            className="text-muted hover:text-foreground inline-flex shrink-0 cursor-pointer items-center self-center border-none bg-transparent p-0 opacity-0 transition-colors duration-200"
+            onClick={(e) => {
+              e.stopPropagation();
+              props.onDelete();
+            }}
+            aria-label={`Delete workspace draft ${props.draftNumber}`}
+            data-project-path={props.projectPath}
+            data-draft-id={props.draftId}
+          >
+            <Trash2 className="h-3 w-3" />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent align="start">Delete draft</TooltipContent>
+      </Tooltip>
+
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span className="text-foreground block truncate text-left text-[14px]">{titleText}</span>
+        {promptPreview.length > 0 && (
+          <span className="text-muted block truncate text-left text-xs">{promptPreview}</span>
+        )}
+      </div>
+    </div>
+  );
+}
 
 // Custom drag layer to show a semi-transparent preview and enforce grabbing cursor
 interface ProjectDragItem {
@@ -259,9 +361,16 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     setSelectedWorkspace: onSelectWorkspace,
     archiveWorkspace: onArchiveWorkspace,
     renameWorkspace: onRenameWorkspace,
-    beginWorkspaceCreation: onAddWorkspace,
     refreshWorkspaceMetadata,
+    pendingNewWorkspaceProject,
+    pendingNewWorkspaceDraftId,
+    workspaceDraftsByProject,
+    workspaceDraftPromotionsByProject,
+    createWorkspaceDraft,
+    openWorkspaceDraft,
+    deleteWorkspaceDraft,
   } = useWorkspaceContext();
+  const { navigateToProject } = useRouter();
 
   // Get project state and operations from context
   const {
@@ -298,12 +407,23 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   // Wrapper to close sidebar on mobile after adding workspace
   const handleAddWorkspace = useCallback(
     (projectPath: string, sectionId?: string) => {
-      onAddWorkspace(projectPath, sectionId);
+      createWorkspaceDraft(projectPath, sectionId);
       if (window.innerWidth <= MOBILE_BREAKPOINT && !collapsed) {
         onToggleCollapsed();
       }
     },
-    [onAddWorkspace, collapsed, onToggleCollapsed]
+    [createWorkspaceDraft, collapsed, onToggleCollapsed]
+  );
+
+  // Wrapper to close sidebar on mobile after opening an existing draft
+  const handleOpenWorkspaceDraft = useCallback(
+    (projectPath: string, draftId: string, sectionId?: string | null) => {
+      openWorkspaceDraft(projectPath, draftId, sectionId);
+      if (window.innerWidth <= MOBILE_BREAKPOINT && !collapsed) {
+        onToggleCollapsed();
+      }
+    },
+    [openWorkspaceDraft, collapsed, onToggleCollapsed]
   );
 
   const handleOpenMuxChat = useCallback(() => {
@@ -742,10 +862,65 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                           >
                             {(() => {
                               // Archived workspaces are excluded from workspaceMetadata so won't appear here
+
                               const allWorkspaces =
                                 sortedWorkspacesByProject.get(projectPath) ?? [];
+
+                              const draftsForProject = workspaceDraftsByProject[projectPath] ?? [];
+                              const activeDraftIds = new Set(
+                                draftsForProject.map((draft) => draft.draftId)
+                              );
+                              const draftPromotionsForProject =
+                                workspaceDraftPromotionsByProject[projectPath] ?? {};
+                              const activeDraftPromotions = Object.fromEntries(
+                                Object.entries(draftPromotionsForProject).filter(([draftId]) =>
+                                  activeDraftIds.has(draftId)
+                                )
+                              );
+                              const promotedWorkspaceIds = new Set(
+                                Object.values(activeDraftPromotions).map((metadata) => metadata.id)
+                              );
+                              const workspacesForNormalRendering = allWorkspaces.filter(
+                                (workspace) => !promotedWorkspaceIds.has(workspace.id)
+                              );
                               const sections = sortSectionsByLinkedList(config.sections ?? []);
                               const depthByWorkspaceId = computeWorkspaceDepthMap(allWorkspaces);
+                              const sortedDrafts = draftsForProject
+                                .slice()
+                                .sort((a, b) => a.createdAt - b.createdAt);
+                              const draftNumberById = new Map(
+                                sortedDrafts.map(
+                                  (draft, index) => [draft.draftId, index + 1] as const
+                                )
+                              );
+                              const sectionIds = new Set(sections.map((section) => section.id));
+                              const normalizeDraftSectionId = (
+                                draft: (typeof sortedDrafts)[number]
+                              ): string | null => {
+                                return typeof draft.sectionId === "string" &&
+                                  sectionIds.has(draft.sectionId)
+                                  ? draft.sectionId
+                                  : null;
+                              };
+
+                              // Drafts can reference a section that has since been deleted.
+                              // Treat those as unsectioned so they remain accessible.
+                              const unsectionedDrafts: typeof sortedDrafts = [];
+                              const draftsBySectionId = new Map<string, typeof sortedDrafts>();
+                              for (const draft of sortedDrafts) {
+                                const sectionId = normalizeDraftSectionId(draft);
+                                if (sectionId === null) {
+                                  unsectionedDrafts.push(draft);
+                                  continue;
+                                }
+
+                                const existing = draftsBySectionId.get(sectionId);
+                                if (existing) {
+                                  existing.push(draft);
+                                } else {
+                                  draftsBySectionId.set(sectionId, [draft]);
+                                }
+                              }
 
                               const renderWorkspace = (
                                 metadata: FrontendWorkspaceMetadata,
@@ -764,6 +939,67 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                   sectionId={sectionId}
                                 />
                               );
+
+                              const renderDraft = (
+                                draft: (typeof sortedDrafts)[number]
+                              ): React.ReactNode => {
+                                const sectionId = normalizeDraftSectionId(draft);
+                                const promotedMetadata = activeDraftPromotions[draft.draftId];
+
+                                if (promotedMetadata) {
+                                  const liveMetadata =
+                                    allWorkspaces.find(
+                                      (workspace) => workspace.id === promotedMetadata.id
+                                    ) ?? promotedMetadata;
+                                  return renderWorkspace(liveMetadata, sectionId ?? undefined);
+                                }
+
+                                const draftNumber = draftNumberById.get(draft.draftId) ?? 0;
+                                const isSelected =
+                                  pendingNewWorkspaceProject === projectPath &&
+                                  pendingNewWorkspaceDraftId === draft.draftId;
+
+                                return (
+                                  <DraftWorkspaceListItem
+                                    key={draft.draftId}
+                                    projectPath={projectPath}
+                                    draftId={draft.draftId}
+                                    draftNumber={draftNumber}
+                                    isSelected={isSelected}
+                                    onOpen={() =>
+                                      handleOpenWorkspaceDraft(
+                                        projectPath,
+                                        draft.draftId,
+                                        sectionId
+                                      )
+                                    }
+                                    onDelete={() => {
+                                      if (isSelected) {
+                                        const currentIndex = sortedDrafts.findIndex(
+                                          (d) => d.draftId === draft.draftId
+                                        );
+                                        const fallback =
+                                          currentIndex >= 0
+                                            ? (sortedDrafts[currentIndex + 1] ??
+                                              sortedDrafts[currentIndex - 1])
+                                            : undefined;
+
+                                        if (fallback) {
+                                          openWorkspaceDraft(
+                                            projectPath,
+                                            fallback.draftId,
+                                            normalizeDraftSectionId(fallback)
+                                          );
+                                        } else {
+                                          navigateToProject(projectPath, sectionId ?? undefined);
+                                        }
+                                      }
+
+                                      deleteWorkspaceDraft(projectPath, draft.draftId);
+                                    }}
+                                  />
+                                );
+                              };
 
                               // Render age tiers for a list of workspaces
                               const renderAgeTiers = (
@@ -854,7 +1090,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
 
                               // Partition workspaces by section
                               const { unsectioned, bySectionId } = partitionWorkspacesBySection(
-                                allWorkspaces,
+                                workspacesForNormalRendering,
                                 sections
                               );
 
@@ -902,6 +1138,8 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                               // Render section with its workspaces
                               const renderSection = (section: SectionConfig) => {
                                 const sectionWorkspaces = bySectionId.get(section.id) ?? [];
+                                const sectionDrafts = draftsBySectionId.get(section.id) ?? [];
+
                                 const sectionExpandedKey = getSectionExpandedKey(
                                   projectPath,
                                   section.id
@@ -925,7 +1163,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                       <SectionHeader
                                         section={section}
                                         isExpanded={isSectionExpanded}
-                                        workspaceCount={sectionWorkspaces.length}
+                                        workspaceCount={
+                                          sectionWorkspaces.length + sectionDrafts.length
+                                        }
                                         onToggleExpand={() =>
                                           toggleSection(projectPath, section.id)
                                         }
@@ -949,6 +1189,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                       />
                                       {isSectionExpanded && (
                                         <div className="pb-1">
+                                          {sectionDrafts.map((draft) => renderDraft(draft))}
                                           {sectionWorkspaces.length > 0 ? (
                                             renderAgeTiers(
                                               sectionWorkspaces,
@@ -958,11 +1199,11 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                               ),
                                               section.id
                                             )
-                                          ) : (
+                                          ) : sectionDrafts.length === 0 ? (
                                             <div className="text-muted px-3 py-2 text-center text-xs italic">
                                               No workspaces in this section
                                             </div>
-                                          )}
+                                          ) : null}
                                         </div>
                                       )}
                                     </WorkspaceSectionDropZone>
@@ -980,23 +1221,27 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                       onDrop={handleWorkspaceSectionDrop}
                                       testId="unsectioned-drop-zone"
                                     >
+                                      {unsectionedDrafts.map((draft) => renderDraft(draft))}
                                       {unsectioned.length > 0 ? (
                                         renderAgeTiers(
                                           unsectioned,
                                           getTierKey(projectPath, 0).replace(":0", "")
                                         )
-                                      ) : (
+                                      ) : unsectionedDrafts.length === 0 ? (
                                         <div className="text-muted px-3 py-2 text-center text-xs italic">
                                           No unsectioned workspaces
                                         </div>
-                                      )}
+                                      ) : null}
                                     </WorkspaceSectionDropZone>
                                   ) : (
-                                    unsectioned.length > 0 &&
-                                    renderAgeTiers(
-                                      unsectioned,
-                                      getTierKey(projectPath, 0).replace(":0", "")
-                                    )
+                                    <>
+                                      {unsectionedDrafts.map((draft) => renderDraft(draft))}
+                                      {unsectioned.length > 0 &&
+                                        renderAgeTiers(
+                                          unsectioned,
+                                          getTierKey(projectPath, 0).replace(":0", "")
+                                        )}
+                                    </>
                                   )}
 
                                   {/* Sections */}

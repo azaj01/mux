@@ -37,6 +37,7 @@ import {
   VIM_ENABLED_KEY,
   getProjectScopeId,
   getPendingScopeId,
+  getDraftScopeId,
   getPendingWorkspaceSendErrorKey,
   getWorkspaceLastReadKey,
 } from "@/common/constants/storage";
@@ -141,6 +142,8 @@ export type { ChatInputProps, ChatInputAPI };
 const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const { api } = useAPI();
   const { variant } = props;
+  const creationProjectPath = variant === "creation" ? props.projectPath : "";
+  const creationDraftId = variant === "creation" ? props.pendingDraftId : null;
   const [thinkingLevel] = useThinkingLevel();
   const atMentionProjectPath = variant === "creation" ? props.projectPath : null;
   const workspaceId = variant === "workspace" ? props.workspaceId : null;
@@ -159,7 +162,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // Storage keys differ by variant
   const storageKeys = (() => {
     if (variant === "creation") {
-      const pendingScopeId = getPendingScopeId(props.projectPath);
+      const pendingScopeId =
+        typeof props.pendingDraftId === "string" && props.pendingDraftId.trim().length > 0
+          ? getDraftScopeId(props.projectPath, props.pendingDraftId)
+          : getPendingScopeId(props.projectPath);
       return {
         inputKey: getInputKey(pendingScopeId),
         attachmentsKey: getInputAttachmentsKey(pendingScopeId),
@@ -325,7 +331,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   );
   const preEditDraftRef = useRef<DraftState>({ text: "", attachments: [] });
   const { open } = useSettings();
-  const { selectedWorkspace } = useWorkspaceContext();
+  const { selectedWorkspace, beginWorkspaceCreation, updateWorkspaceDraftSection } =
+    useWorkspaceContext();
   const { agentId, currentAgent } = useAgent();
 
   // Use current agent's uiColor, or neutral border until agents load
@@ -534,6 +541,33 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     }
   }, [creationProject, selectedSectionId, variant]);
 
+  const handleCreationSectionChange = useCallback(
+    (sectionId: string | null) => {
+      setSelectedSectionId(sectionId);
+
+      if (variant !== "creation") {
+        return;
+      }
+
+      if (typeof creationDraftId === "string" && creationDraftId.trim().length > 0) {
+        updateWorkspaceDraftSection(creationProjectPath, creationDraftId, sectionId);
+        return;
+      }
+
+      beginWorkspaceCreation(
+        creationProjectPath,
+        typeof sectionId === "string" && sectionId.trim().length > 0 ? sectionId : undefined
+      );
+    },
+    [
+      beginWorkspaceCreation,
+      creationDraftId,
+      creationProjectPath,
+      updateWorkspaceDraftSection,
+      variant,
+    ]
+  );
+
   // Creation-specific state (hook always called, but only used when variant === "creation")
   // This avoids conditional hook calls which violate React rules
   const creationState = useCreationWorkspace(
@@ -543,6 +577,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           onWorkspaceCreated: props.onWorkspaceCreated,
           message: input,
           sectionId: selectedSectionId,
+          draftId: props.pendingDraftId,
           userModel: preferredModel,
         }
       : {
@@ -603,7 +638,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           runtimeAvailabilityState: creationState.runtimeAvailabilityState,
           sections: creationSections,
           selectedSectionId,
-          onSectionChange: setSelectedSectionId,
+          onSectionChange: handleCreationSectionChange,
           runtimeFieldError,
           // Pass coderProps when CLI is available/outdated, Coder is enabled, or still checking (so "Checking…" UI renders)
           coderProps:
@@ -637,8 +672,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     !disabled &&
     !sendInFlightBlocksInput &&
     !coderPresetsLoading;
-
-  const creationProjectPath = variant === "creation" ? props.projectPath : "";
 
   // Creation variant: keep the project-scoped model/thinking in sync with global agent defaults
   // so switching agents uses the configured defaults (and respects "inherit" semantics).
@@ -1507,13 +1540,16 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         creationFileParts.length > 0 ? creationFileParts : undefined,
         creationOptionsOverride
       );
-      if (creationResult.success && isMountedRef.current) {
-        setInput("");
-        setAttachments([]);
-        // Height is managed by VimTextArea's useLayoutEffect - clear inline style
-        // to let CSS min-height take over
-        if (inputRef.current) {
-          inputRef.current.style.height = "";
+
+      if (creationResult.success) {
+        if (isMountedRef.current) {
+          setInput("");
+          setAttachments([]);
+          // Height is managed by VimTextArea's useLayoutEffect - clear inline style
+          // to let CSS min-height take over
+          if (inputRef.current) {
+            inputRef.current.style.height = "";
+          }
         }
       }
       return;

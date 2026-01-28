@@ -21,10 +21,12 @@ import {
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
   getPendingScopeId,
+  getDraftScopeId,
   getPendingWorkspaceSendErrorKey,
   getProjectScopeId,
 } from "@/common/constants/storage";
 import type { SendMessageError } from "@/common/types/errors";
+import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import type { Toast } from "@/browser/components/ChatInputToast";
 import { useAPI } from "@/browser/contexts/API";
 import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
@@ -48,6 +50,8 @@ interface UseCreationWorkspaceOptions {
   message: string;
   /** Section ID to assign the new workspace to */
   sectionId?: string | null;
+  /** Draft ID for UI-only workspace creation drafts (from URL) */
+  draftId?: string | null;
   /** User's currently selected model (for name generation fallback) */
   userModel?: string;
 }
@@ -177,8 +181,12 @@ export function useCreationWorkspace({
   onWorkspaceCreated,
   message,
   sectionId,
+  draftId,
   userModel,
 }: UseCreationWorkspaceOptions): UseCreationWorkspaceReturn {
+  const workspaceContext = useOptionalWorkspaceContext();
+  const promoteWorkspaceDraft = workspaceContext?.promoteWorkspaceDraft;
+  const deleteWorkspaceDraft = workspaceContext?.deleteWorkspaceDraft;
   const { api } = useAPI();
   const [branches, setBranches] = useState<string[]>([]);
   const [branchesLoaded, setBranchesLoaded] = useState(false);
@@ -194,6 +202,15 @@ export function useCreationWorkspace({
   const { settings, setSelectedRuntime, setDefaultRuntimeMode, setTrunkBranch } =
     useDraftWorkspaceSettings(projectPath, branches, recommendedTrunk);
 
+  // Persist draft workspace name generation state per draft (so multiple drafts don't share a
+  // single auto-naming/manual-name state).
+  const workspaceNameScopeId =
+    projectPath.trim().length > 0
+      ? typeof draftId === "string" && draftId.trim().length > 0
+        ? getDraftScopeId(projectPath, draftId)
+        : getPendingScopeId(projectPath)
+      : null;
+
   // Project scope ID for reading send options at send time
   const projectScopeId = getProjectScopeId(projectPath);
 
@@ -203,6 +220,7 @@ export function useCreationWorkspace({
     message,
     debounceMs: 500,
     userModel,
+    scopeId: workspaceNameScopeId,
   });
 
   // Destructure name state functions for use in callbacks
@@ -317,6 +335,9 @@ export function useCreationWorkspace({
         // Set the confirmed identity for splash UI display
         setCreatingWithIdentity(identity);
 
+        const normalizedTitle = typeof identity.title === "string" ? identity.title.trim() : "";
+        const createTitle = normalizedTitle || undefined;
+
         // Read send options fresh from localStorage at send time to avoid
         // race conditions with React state updates (requestAnimationFrame batching
         // in usePersistedState can delay state updates after model selection)
@@ -377,7 +398,7 @@ export function useCreationWorkspace({
           projectPath,
           branchName: identity.name,
           trunkBranch: settings.trunkBranch,
-          title: identity.title,
+          title: createTitle,
           runtimeConfig,
           sectionId: sectionId ?? undefined,
         });
@@ -409,7 +430,28 @@ export function useCreationWorkspace({
             // Ignore - sendMessage will persist AI settings as a fallback.
           });
 
-        const pendingScopeId = projectPath ? getPendingScopeId(projectPath) : null;
+        const isDraftScope = typeof draftId === "string" && draftId.trim().length > 0;
+        const pendingScopeId = projectPath
+          ? isDraftScope
+            ? getDraftScopeId(projectPath, draftId)
+            : getPendingScopeId(projectPath)
+          : null;
+
+        const clearPendingDraft = () => {
+          // Once the workspace exists, drop the draft even if the initial send fails
+          // so we don't keep a hidden placeholder in the sidebar.
+          if (!pendingScopeId) {
+            return;
+          }
+
+          if (isDraftScope && deleteWorkspaceDraft && typeof draftId === "string") {
+            deleteWorkspaceDraft(projectPath, draftId);
+            return;
+          }
+
+          updatePersistedState(getInputKey(pendingScopeId), "");
+          updatePersistedState(getInputAttachmentsKey(pendingScopeId), undefined);
+        };
 
         // Sync preferences before switching (keeps workspace settings consistent).
         syncCreationPreferences(projectPath, metadata.id);
@@ -417,9 +459,15 @@ export function useCreationWorkspace({
         // Switch to the workspace IMMEDIATELY after creation to exit splash faster.
         // The user sees the workspace UI while sendMessage kicks off the stream.
         onWorkspaceCreated(metadata);
+
+        if (typeof draftId === "string" && draftId.trim().length > 0 && promoteWorkspaceDraft) {
+          // UI-only: show the created workspace in-place where the draft was rendered.
+          promoteWorkspaceDraft(projectPath, draftId, metadata);
+        }
+
         setIsSending(false);
 
-        // Wait for the initial send result so the creation flow can preserve drafts on failure.
+        // Wait for the initial send result so we can surface errors and clean up draft state.
         const additionalSystemInstructions = [
           sendMessageOptions.additionalSystemInstructions,
           optionsOverride?.additionalSystemInstructions,
@@ -445,15 +493,11 @@ export function useCreationWorkspace({
             // Persist the failure so the workspace view can surface a toast after navigation.
             updatePersistedState(getPendingWorkspaceSendErrorKey(metadata.id), sendResult.error);
           }
-          // Preserve draft input/attachments so the user can retry later.
+          clearPendingDraft();
           return { success: false, error: sendResult.error };
         }
 
-        if (pendingScopeId) {
-          updatePersistedState(getInputKey(pendingScopeId), "");
-          updatePersistedState(getInputAttachmentsKey(pendingScopeId), undefined);
-        }
-
+        clearPendingDraft();
         return { success: true };
       } catch (err) {
         const errorMessage = err instanceof Error ? err.message : String(err);
@@ -481,6 +525,9 @@ export function useCreationWorkspace({
       settings.trunkBranch,
       waitForGeneration,
       sectionId,
+      draftId,
+      promoteWorkspaceDraft,
+      deleteWorkspaceDraft,
     ]
   );
 
