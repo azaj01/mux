@@ -12,6 +12,20 @@ import { getEmptyImage } from "react-dnd-html5-backend";
 import { GitStatusIndicator } from "./GitStatusIndicator";
 import { RuntimeBadge } from "./RuntimeBadge";
 import { Tooltip, TooltipTrigger, TooltipContent } from "./ui/tooltip";
+import { HoverCard, HoverCardTrigger, HoverCardContent } from "./ui/hover-card";
+
+const RADIX_PORTAL_WRAPPER_SELECTOR = "[data-radix-popper-content-wrapper]" as const;
+
+/** Prevent HoverCard from closing when interacting with nested Radix portals (e.g., RuntimeBadge tooltip) */
+function preventHoverCardDismissForRadixPortals(e: {
+  target: EventTarget | null;
+  preventDefault: () => void;
+}) {
+  const target = e.target;
+  if (target instanceof HTMLElement && target.closest(RADIX_PORTAL_WRAPPER_SELECTOR)) {
+    e.preventDefault();
+  }
+}
 import { WorkspaceStatusIndicator } from "./WorkspaceStatusIndicator";
 import { Shimmer } from "./ai-elements/shimmer";
 import { ArchiveIcon } from "./icons/ArchiveIcon";
@@ -109,7 +123,9 @@ const WorkspaceListItemInner: React.FC<WorkspaceListItemProps> = ({
     }
   };
 
-  const { canInterrupt, awaitingUserQuestion, isStarting } = useWorkspaceSidebarState(workspaceId);
+  const { canInterrupt, awaitingUserQuestion, isStarting, agentStatus } =
+    useWorkspaceSidebarState(workspaceId);
+  const hasStatusText = Boolean(agentStatus ?? awaitingUserQuestion);
 
   const showUnreadBar = !isCreating && !isEditing && isUnread && !(isSelected && !isDisabled);
   const barColorClass =
@@ -218,9 +234,14 @@ const WorkspaceListItemInner: React.FC<WorkspaceListItemProps> = ({
         ) : (
           unreadBar
         )}
-        {/* Archive button - vertically centered against entire item */}
+        {/* Archive button - centered when status text visible, top-aligned otherwise */}
         {!isMuxHelpChat && !isCreating && !isEditing && (
-          <div className="relative inline-flex h-4 w-4 shrink-0 items-center self-center">
+          <div
+            className={cn(
+              "relative inline-flex h-4 w-4 shrink-0 items-center",
+              hasStatusText ? "self-center" : "self-start mt-0.5"
+            )}
+          >
             <Tooltip>
               <TooltipTrigger asChild>
                 <button
@@ -242,14 +263,7 @@ const WorkspaceListItemInner: React.FC<WorkspaceListItemProps> = ({
           </div>
         )}
         <div className="flex min-w-0 flex-1 flex-col gap-1">
-          <div className="grid min-w-0 grid-cols-[auto_1fr_auto] items-center gap-1.5">
-            <RuntimeBadge
-              runtimeConfig={metadata.runtimeConfig}
-              isWorking={isWorking}
-              tooltipSide="bottom"
-              workspaceName={metadata.name}
-              workspacePath={namedWorkspacePath}
-            />
+          <div className="grid min-w-0 grid-cols-[1fr_auto] items-center gap-1.5">
             {isEditing ? (
               <input
                 className="bg-input-bg text-input-text border-input-border font-inherit focus:border-input-border-focus col-span-2 min-w-0 flex-1 rounded-sm border px-1 text-left text-[13px] outline-none"
@@ -263,11 +277,11 @@ const WorkspaceListItemInner: React.FC<WorkspaceListItemProps> = ({
                 data-workspace-id={workspaceId}
               />
             ) : (
-              <Tooltip disableHoverableContent>
-                <TooltipTrigger asChild>
+              <HoverCard openDelay={300} closeDelay={100}>
+                <HoverCardTrigger asChild>
                   <span
                     className={cn(
-                      "text-foreground block truncate text-left text-[14px] transition-colors duration-200",
+                      "text-foreground block truncate text-left text-[13px] transition-colors duration-200",
                       !isDisabled && "cursor-pointer"
                     )}
                     onDoubleClick={(e) => {
@@ -276,24 +290,39 @@ const WorkspaceListItemInner: React.FC<WorkspaceListItemProps> = ({
                       startEditing();
                     }}
                   >
-                    {isWorking || isCreating ? (
-                      <Shimmer className="w-full truncate" colorClass="var(--color-foreground)">
-                        {displayTitle}
-                      </Shimmer>
-                    ) : (
-                      displayTitle
-                    )}
-                  </span>
-                </TooltipTrigger>
-                <TooltipContent align="start" className="max-w-[420px]">
-                  <div className="flex flex-col gap-1">
-                    <div className="text-foreground font-medium break-words whitespace-normal">
+                    {/* Always render text in same structure; Shimmer just adds animation class */}
+                    <Shimmer
+                      className={cn("w-full truncate", !(isWorking || isCreating) && "no-shimmer")}
+                      colorClass="var(--color-foreground)"
+                    >
                       {displayTitle}
+                    </Shimmer>
+                  </span>
+                </HoverCardTrigger>
+                <HoverCardContent
+                  align="start"
+                  sideOffset={8}
+                  className="border-separator-light bg-modal-bg w-auto max-w-[420px] px-[10px] py-[6px] text-[11px] shadow-[0_2px_8px_rgba(0,0,0,0.4)]"
+                  onPointerDownOutside={preventHoverCardDismissForRadixPortals}
+                  onFocusOutside={preventHoverCardDismissForRadixPortals}
+                >
+                  <div className="flex flex-col gap-1">
+                    <div className="flex items-center gap-2">
+                      <RuntimeBadge
+                        runtimeConfig={metadata.runtimeConfig}
+                        workspaceName={metadata.name}
+                        workspacePath={namedWorkspacePath}
+                      />
+                      <span className="text-foreground font-medium break-words whitespace-normal">
+                        {displayTitle}
+                      </span>
                     </div>
-                    {!isDisabled && <div className="text-muted">Double-click to edit title</div>}
+                    {!isDisabled && (
+                      <div className="text-muted text-xs">Double-click to edit title</div>
+                    )}
                   </div>
-                </TooltipContent>
-              </Tooltip>
+                </HoverCardContent>
+              </HoverCard>
             )}
 
             {!isCreating && !isEditing && (
