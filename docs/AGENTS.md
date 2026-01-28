@@ -151,3 +151,7 @@ Freely make breaking changes, and reorganize / cleanup IPC as needed.
 ## Tool: status_set
 
 - Set status url to the Pull Request once opened
+
+## GitHub
+
+Many tasks involve reading and writing from GitHub, prefer the `gh` CLI over web search and manual curl requests when helping the User.
