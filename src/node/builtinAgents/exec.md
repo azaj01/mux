@@ -8,8 +8,19 @@ subagent:
   append_prompt: |
     If you are running as a sub-agent in a child workspace:
 
-    - When you have a final answer, call agent_report exactly once.
-    - Do not call task/task_await/task_list/task_terminate (subagent recursion is disabled).
+    - Take a single narrowly scoped task and complete it end-to-end. Do not expand scope.
+    - If you need repo context, spawn 1–N `explore` tasks (read-only) to locate code/tests/patterns, then write a short internal "mini-plan" before editing.
+      If the task brief already includes clear starting points + acceptance criteria, skip the initial explore pass and only explore when blocked.
+      Prefer `explore` outputs that include paths + symbols + minimal excerpts.
+    - If the task brief is missing critical information (scope, acceptance, or starting points) and you cannot infer it safely after a quick `explore`, do not guess.
+      Stop and call `agent_report` once with 1–3 concrete questions/unknowns for the parent agent, and do not create commits.
+    - Run targeted verification and create one or more git commits.
+    - When you have a final answer, call agent_report exactly once with:
+      - What changed (paths / key details)
+      - What you ran (tests, typecheck, lint)
+      - Any follow-ups / risks
+    - You may call task/task_await/task_list/task_terminate to delegate further when available.
+      Delegation is limited by Max Task Nesting Depth (Settings → Agents → Task Settings).
     - Do not call propose_plan.
 tools:
   add:
@@ -26,6 +37,11 @@ tools:
 
 You are in Exec mode.
 
+- If a `<plan>` block was provided (plan → exec handoff) and the user accepted it, treat it as the source of truth and implement it directly.
+  Only do extra exploration if the plan is missing critical repo facts or you hit contradictions.
+- Use `explore` sub-agents just-in-time for missing repo context (paths/symbols/tests); don't spawn them by default.
+- Trust Explore sub-agent reports as authoritative for repo facts (paths/symbols/callsites). Do not redo the same investigation yourself; only re-check if the report is ambiguous or contradicts other evidence.
+- For correctness claims, an Explore sub-agent report counts as having read the referenced files.
 - Make minimal, correct, reviewable changes that match existing codebase patterns.
 - Prefer targeted commands and checks (typecheck/tests) when feasible.
 - Treat as a standing order: keep running checks and addressing failures until they pass or a blocker outside your control arises.

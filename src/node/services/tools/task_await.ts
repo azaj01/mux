@@ -1,6 +1,7 @@
 import { tool } from "ai";
 
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
+import { readSubagentGitPatchArtifact } from "@/node/services/subagentGitPatchArtifacts";
 import { TaskAwaitToolResultSchema, TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 
 import { fromBashTaskId, toBashTaskId } from "./taskId";
@@ -62,6 +63,14 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
           ) => string[];
         }
       ).filterDescendantAgentTaskIds;
+
+      // Read patch artifacts lazily (after waiting) to avoid stale results. Patch generation is
+      // started after `resolveWaiters` in `handleAgentReport`, so reading once up-front can miss
+      // artifacts that appear while we're awaiting reports.
+      const readGitFormatPatchArtifact = async (childTaskId: string) => {
+        if (!config.workspaceSessionDir) return null;
+        return await readSubagentGitPatchArtifact(config.workspaceSessionDir, childTaskId);
+      };
       const descendantAgentTaskIdSet = new Set(
         typeof bulkFilter === "function"
           ? bulkFilter.call(taskService, workspaceId, agentTaskIds)
@@ -157,11 +166,14 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
                 abortSignal,
                 requestingWorkspaceId: workspaceId,
               });
+
+              const gitFormatPatch = await readGitFormatPatchArtifact(taskId);
               return {
                 status: "completed" as const,
                 taskId,
                 reportMarkdown: report.reportMarkdown,
                 title: report.title,
+                ...(gitFormatPatch ? { artifacts: { gitFormatPatch } } : {}),
               };
             } catch (error: unknown) {
               const message = error instanceof Error ? error.message : String(error);
@@ -178,11 +190,14 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
               abortSignal,
               requestingWorkspaceId: workspaceId,
             });
+
+            const gitFormatPatch = await readGitFormatPatchArtifact(taskId);
             return {
               status: "completed" as const,
               taskId,
               reportMarkdown: report.reportMarkdown,
               title: report.title,
+              ...(gitFormatPatch ? { artifacts: { gitFormatPatch } } : {}),
             };
           } catch (error: unknown) {
             if (abortSignal?.aborted) {
