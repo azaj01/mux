@@ -9,6 +9,7 @@ import userEvent from "@testing-library/user-event";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import { getModelKey } from "@/common/constants/storage";
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { formatModelDisplayName } from "@/common/utils/ai/modelDisplay";
 
 import { shouldRunIntegrationTests } from "../testUtils";
 import { createAppHarness } from "./harness";
@@ -59,57 +60,79 @@ async function selectModel(
       throw new Error(`Expected model ${model} but got ${persisted}`);
     }
   });
+
+  // Wait for the UI to reflect the new model. This guards against race conditions
+  // where backend metadata updates can temporarily revert localStorage (and thus
+  // the displayed model) when switching models rapidly.
+  // Use the exact display name that the UI will show.
+  const modelName = model.split(":")[1] ?? model;
+  const expectedDisplayName = formatModelDisplayName(modelName).toLowerCase();
+  await waitFor(
+    () => {
+      const modelGroup = container.querySelector('[data-component="ModelSelectorGroup"]');
+      const displayedModel = (modelGroup?.textContent ?? "").toLowerCase();
+      if (!displayedModel.includes(expectedDisplayName)) {
+        throw new Error(
+          `Waiting for UI to show "${expectedDisplayName}", currently shows "${displayedModel}"`
+        );
+      }
+    },
+    { timeout: 3000 }
+  );
+
+  // Wait for UI to stabilize - ensure thinking slider is present and not in flux.
+  // Backend metadata updates can cause re-renders; waiting for a stable state
+  // prevents races when the test immediately interacts with thinking controls.
+  await waitFor(
+    () => {
+      const thinkingButton = container.querySelector(
+        '[data-component="ThinkingSliderGroup"] button span'
+      );
+      if (!thinkingButton?.textContent) {
+        throw new Error("Waiting for thinking controls to stabilize");
+      }
+    },
+    { timeout: 2000 }
+  );
 }
 
 async function setThinkingToMax(container: HTMLElement): Promise<void> {
-  // Wait for the thinking slider to render
-  const button = await waitFor(
-    () => {
-      const btn = container.querySelector(
+  // Wait for the thinking slider to render and for it to show xhigh.
+  // We cycle by clicking the button, which cycles through levels.
+  // For CODEX model the levels are: off → low → medium → high → xhigh → off...
+  await waitFor(
+    async () => {
+      const button = container.querySelector(
         '[data-component="ThinkingSliderGroup"] button'
       ) as HTMLButtonElement | null;
-      if (!btn) {
+      if (!button) {
         throw new Error("Thinking level button not found");
       }
-      return btn;
+
+      const current = button.querySelector("span")?.textContent?.trim()?.toLowerCase();
+      if (current === "xhigh") {
+        return; // Done!
+      }
+
+      // Click to cycle to next level
+      fireEvent.click(button);
+      throw new Error(`Cycling thinking level, currently at: ${current ?? "<missing>"}`);
     },
-    { timeout: 5000 }
-  );
-
-  // Cycle by clicking until we hit xhigh
-  const maxIterations = 10;
-  for (let i = 0; i < maxIterations; i++) {
-    const current = button.querySelector("span")?.textContent?.trim()?.toLowerCase();
-    if (current === "xhigh") {
-      return;
-    }
-    fireEvent.click(button);
-
-    // Wait for level to change before next iteration
-    await waitFor(
-      () => {
-        const updated = button.querySelector("span")?.textContent?.trim()?.toLowerCase();
-        if (!updated || updated === current) {
-          throw new Error("Waiting for thinking level to change");
-        }
-      },
-      { timeout: 1000 }
-    );
-  }
-  const final = button.querySelector("span")?.textContent;
-  throw new Error(
-    `Failed to reach xhigh after max iterations. Last value: ${final ?? "<missing>"}`
+    { timeout: 10000, interval: 200 }
   );
 }
 
 async function expectThinkingLabel(container: HTMLElement, expected: string): Promise<void> {
-  await waitFor(() => {
-    const label = container.querySelector('[data-component="ThinkingSliderGroup"] button span');
-    const text = label?.textContent?.trim();
-    if (text !== expected) {
-      throw new Error(`Expected thinking label ${expected} but got ${text ?? "<missing>"}`);
-    }
-  });
+  await waitFor(
+    () => {
+      const label = container.querySelector('[data-component="ThinkingSliderGroup"] button span');
+      const text = label?.textContent?.trim();
+      if (text !== expected) {
+        throw new Error(`Expected thinking label ${expected} but got ${text ?? "<missing>"}`);
+      }
+    },
+    { timeout: 3000 }
+  );
 }
 
 describeIntegration("Thinking level persistence", () => {
