@@ -1360,6 +1360,85 @@ export const router = (authToken?: string) => {
             return result;
           }),
       },
+      mcpOauth: {
+        startDesktopFlow: t
+          .input(schemas.projects.mcpOauth.startDesktopFlow.input)
+          .output(schemas.projects.mcpOauth.startDesktopFlow.output)
+          .handler(async ({ context, input }) => {
+            return context.mcpOauthService.startDesktopFlow(input);
+          }),
+        waitForDesktopFlow: t
+          .input(schemas.projects.mcpOauth.waitForDesktopFlow.input)
+          .output(schemas.projects.mcpOauth.waitForDesktopFlow.output)
+          .handler(async ({ context, input }) => {
+            return context.mcpOauthService.waitForDesktopFlow(input.flowId, {
+              timeoutMs: input.timeoutMs,
+            });
+          }),
+        cancelDesktopFlow: t
+          .input(schemas.projects.mcpOauth.cancelDesktopFlow.input)
+          .output(schemas.projects.mcpOauth.cancelDesktopFlow.output)
+          .handler(async ({ context, input }) => {
+            await context.mcpOauthService.cancelDesktopFlow(input.flowId);
+          }),
+        startServerFlow: t
+          .input(schemas.projects.mcpOauth.startServerFlow.input)
+          .output(schemas.projects.mcpOauth.startServerFlow.output)
+          .handler(async ({ context, input }) => {
+            const headers = context.headers;
+
+            const origin = typeof headers?.origin === "string" ? headers.origin.trim() : "";
+            if (origin) {
+              try {
+                const redirectUri = new URL("/auth/mcp-oauth/callback", origin).toString();
+                return context.mcpOauthService.startServerFlow({ ...input, redirectUri });
+              } catch {
+                // Fall back to Host header.
+              }
+            }
+
+            const hostHeader = headers?.["x-forwarded-host"] ?? headers?.host;
+            const host = typeof hostHeader === "string" ? hostHeader.split(",")[0]?.trim() : "";
+            if (!host) {
+              return Err("Missing Host header");
+            }
+
+            const protoHeader = headers?.["x-forwarded-proto"];
+            const forwardedProto =
+              typeof protoHeader === "string" ? protoHeader.split(",")[0]?.trim() : "";
+            const proto = forwardedProto.length ? forwardedProto : "http";
+
+            const redirectUri = `${proto}://${host}/auth/mcp-oauth/callback`;
+
+            return context.mcpOauthService.startServerFlow({ ...input, redirectUri });
+          }),
+        waitForServerFlow: t
+          .input(schemas.projects.mcpOauth.waitForServerFlow.input)
+          .output(schemas.projects.mcpOauth.waitForServerFlow.output)
+          .handler(async ({ context, input }) => {
+            return context.mcpOauthService.waitForServerFlow(input.flowId, {
+              timeoutMs: input.timeoutMs,
+            });
+          }),
+        cancelServerFlow: t
+          .input(schemas.projects.mcpOauth.cancelServerFlow.input)
+          .output(schemas.projects.mcpOauth.cancelServerFlow.output)
+          .handler(async ({ context, input }) => {
+            await context.mcpOauthService.cancelServerFlow(input.flowId);
+          }),
+        getAuthStatus: t
+          .input(schemas.projects.mcpOauth.getAuthStatus.input)
+          .output(schemas.projects.mcpOauth.getAuthStatus.output)
+          .handler(async ({ context, input }) => {
+            return context.mcpOauthService.getAuthStatus(input.projectPath, input.serverName);
+          }),
+        logout: t
+          .input(schemas.projects.mcpOauth.logout.input)
+          .output(schemas.projects.mcpOauth.logout.output)
+          .handler(async ({ context, input }) => {
+            return context.mcpOauthService.logout(input.projectPath, input.serverName);
+          }),
+      },
       idleCompaction: {
         get: t
           .input(schemas.projects.idleCompaction.get.input)

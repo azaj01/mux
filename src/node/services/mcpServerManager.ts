@@ -1,8 +1,9 @@
-import { experimental_createMCPClient } from "@ai-sdk/mcp";
+import { experimental_createMCPClient, type OAuthClientProvider } from "@ai-sdk/mcp";
 import type { Tool } from "ai";
 import { log } from "@/node/services/log";
 import { MCPStdioTransport } from "@/node/services/mcpStdioTransport";
 import type {
+  BearerChallenge,
   MCPHeaderValue,
   MCPServerInfo,
   MCPServerMap,
@@ -13,6 +14,7 @@ import type {
 import type { Runtime } from "@/node/runtime/Runtime";
 import type { PolicyService } from "@/node/services/policyService";
 import type { MCPConfigService } from "@/node/services/mcpConfigService";
+import { parseBearerWwwAuthenticate, type McpOauthService } from "@/node/services/mcpOauthService";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { transformMCPResult, type MCPCallToolResult } from "@/node/services/mcpResultTransform";
 import { buildMcpToolName } from "@/common/utils/tools/mcpToolName";
@@ -120,7 +122,7 @@ function extractHttpStatusCode(error: unknown): number | null {
   // Best-effort fallback on message contents.
   const message = obj.message;
   if (typeof message === "string") {
-    const re = /\b(400|404|405)\b/;
+    const re = /\b(400|401|403|404|405)\b/;
     const match = re.exec(message);
     if (match) {
       return Number(match[1]);
@@ -135,6 +137,144 @@ function shouldAutoFallbackToSse(error: unknown): boolean {
   return status === 400 || status === 404 || status === 405;
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasHeaderGetter(value: unknown): value is { get: (name: string) => unknown } {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    "get" in value &&
+    typeof (value as { get: unknown }).get === "function"
+  );
+}
+
+function extractHeaderValue(headers: unknown, name: string): string | null {
+  if (!headers) {
+    return null;
+  }
+
+  if (typeof Headers !== "undefined" && headers instanceof Headers) {
+    return headers.get(name);
+  }
+
+  if (hasHeaderGetter(headers)) {
+    const value = headers.get(name);
+    return typeof value === "string" ? value : null;
+  }
+
+  if (isPlainObject(headers)) {
+    const target = name.toLowerCase();
+    for (const [key, value] of Object.entries(headers)) {
+      if (key.toLowerCase() !== target) {
+        continue;
+      }
+
+      if (typeof value === "string") {
+        return value;
+      }
+
+      if (Array.isArray(value) && value.every((v) => typeof v === "string")) {
+        return value.join(", ");
+      }
+    }
+  }
+
+  return null;
+}
+
+function extractWwwAuthenticateHeader(error: unknown): string | null {
+  if (!isPlainObject(error)) {
+    return null;
+  }
+
+  const direct =
+    extractHeaderValue(error.responseHeaders, "www-authenticate") ??
+    extractHeaderValue(error.headers, "www-authenticate");
+
+  if (direct) {
+    return direct;
+  }
+
+  const response = error.response;
+  if (isPlainObject(response)) {
+    const fromResponse = extractHeaderValue(response.headers, "www-authenticate");
+    if (fromResponse) {
+      return fromResponse;
+    }
+  }
+
+  const data = error.data;
+  if (isPlainObject(data)) {
+    const fromData =
+      extractHeaderValue(data.responseHeaders, "www-authenticate") ??
+      extractHeaderValue(data.headers, "www-authenticate");
+
+    if (fromData) {
+      return fromData;
+    }
+  }
+
+  const cause = error.cause;
+  if (cause) {
+    return extractWwwAuthenticateHeader(cause);
+  }
+
+  return null;
+}
+
+async function probeWwwAuthenticateHeader(url: string): Promise<string | null> {
+  const abortController = new AbortController();
+  const timeout = setTimeout(() => abortController.abort(), 3_000);
+
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        Accept: "text/event-stream",
+      },
+      redirect: "manual",
+      signal: abortController.signal,
+    });
+
+    return response.headers.get("www-authenticate");
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function extractBearerOauthChallenge(options: {
+  error: unknown;
+  serverUrl: string | null;
+}): Promise<BearerChallenge | null> {
+  const status = extractHttpStatusCode(options.error);
+  if (status !== 401 && status !== 403) {
+    return null;
+  }
+
+  let header = extractWwwAuthenticateHeader(options.error);
+  if (!header && options.serverUrl) {
+    header = await probeWwwAuthenticateHeader(options.serverUrl);
+  }
+
+  if (!header) {
+    return null;
+  }
+
+  const challenge = parseBearerWwwAuthenticate(header);
+  if (!challenge) {
+    return null;
+  }
+
+  return {
+    scope: challenge.scope,
+    resourceMetadataUrl: challenge.resourceMetadataUrl?.toString(),
+  };
+}
+
 export type { MCPTestResult } from "@/common/types/mcp";
 
 /**
@@ -144,7 +284,12 @@ export type { MCPTestResult } from "@/common/types/mcp";
 async function runServerTest(
   server:
     | { transport: "stdio"; command: string }
-    | { transport: "http" | "sse" | "auto"; url: string; headers?: ResolvedHeaders },
+    | {
+        transport: "http" | "sse" | "auto";
+        url: string;
+        headers?: ResolvedHeaders;
+        authProvider?: OAuthClientProvider;
+      },
   projectPath: string,
   logContext: string
 ): Promise<MCPTestResult> {
@@ -172,12 +317,17 @@ async function runServerTest(
       } else {
         log.debug(`[MCP] Testing ${logContext}`, { transport: server.transport });
 
+        const transportBase = {
+          url: server.url,
+          headers: server.headers,
+          ...(server.authProvider ? { authProvider: server.authProvider } : {}),
+        };
+
         const tryHttp = async () =>
           experimental_createMCPClient({
             transport: {
               type: "http",
-              url: server.url,
-              headers: server.headers,
+              ...transportBase,
             },
           });
 
@@ -185,8 +335,7 @@ async function runServerTest(
           experimental_createMCPClient({
             transport: {
               type: "sse",
-              url: server.url,
-              headers: server.headers,
+              ...transportBase,
             },
           });
 
@@ -243,7 +392,16 @@ async function runServerTest(
         }
       }
 
-      return { success: false, error: message };
+      const oauthChallenge = await extractBearerOauthChallenge({
+        error,
+        serverUrl: server.transport === "stdio" ? null : server.url,
+      });
+
+      return {
+        success: false,
+        error: message,
+        ...(oauthChallenge ? { oauthChallenge } : {}),
+      };
     }
   })();
 
@@ -299,10 +457,14 @@ export class MCPServerManager {
   private readonly idleCheckInterval: ReturnType<typeof setInterval>;
   private inlineServers: Record<string, string> = {};
   private policyService: PolicyService | null = null;
+  private mcpOauthService: McpOauthService | null = null;
   private ignoreConfigFile = false;
 
   setPolicyService(service: PolicyService): void {
     this.policyService = service;
+  }
+  setMcpOauthService(service: McpOauthService): void {
+    this.mcpOauthService = service;
   }
   constructor(
     private readonly configService: MCPConfigService,
@@ -570,12 +732,38 @@ export class MCPServerManager {
         continue;
       }
 
+      // OAuth status affects whether we can attach authProvider during server start.
+      // Include this (redacted) information in the signature so we retry starting
+      // remote servers after a user logs in/out.
+      let hasOauthTokens = false;
+      if (this.mcpOauthService) {
+        try {
+          hasOauthTokens = await this.mcpOauthService.hasAuthTokens({
+            projectPath,
+            serverName: name,
+            serverUrl: info.url,
+          });
+        } catch (error) {
+          log.debug("[MCP] Failed to resolve MCP OAuth status", { name, error });
+        }
+      }
+
       try {
         const { headers } = resolveHeaders(info.headers, projectSecrets);
-        signatureEntries[name] = { transport: info.transport, url: info.url, headers };
+        signatureEntries[name] = {
+          transport: info.transport,
+          url: info.url,
+          headers,
+          hasOauthTokens,
+        };
       } catch {
         // Missing secrets or invalid header config. Keep signature stable but avoid leaking details.
-        signatureEntries[name] = { transport: info.transport, url: info.url, headers: null };
+        signatureEntries[name] = {
+          transport: info.transport,
+          url: info.url,
+          headers: null,
+          hasOauthTokens,
+        };
       }
     }
 
@@ -648,6 +836,7 @@ export class MCPServerManager {
         const restartedInstances = await this.startServers(
           serversToRestart,
           runtime,
+          projectPath,
           workspacePath,
           projectSecrets,
           () => this.markActivity(workspaceId)
@@ -692,6 +881,7 @@ export class MCPServerManager {
     const instances = await this.startServers(
       enabledServers,
       runtime,
+      projectPath,
       workspacePath,
       projectSecrets,
       () => this.markActivity(workspaceId)
@@ -779,12 +969,13 @@ export class MCPServerManager {
       return !this.policyService?.isEnforced() || this.policyService.isMcpTransportAllowed(t);
     };
     const { projectPath, name, command, transport, url, headers, projectSecrets } = options;
+    const trimmedName = name?.trim();
 
-    if (name?.trim()) {
+    if (trimmedName && !command?.trim() && !url?.trim()) {
       const servers = await this.configService.listServers(projectPath);
-      const server = servers[name];
+      const server = servers[trimmedName];
       if (!server) {
-        return { success: false, error: `Server "${name}" not found in configuration` };
+        return { success: false, error: `Server "${trimmedName}" not found in configuration` };
       }
 
       if (!isTransportAllowed(server.transport)) {
@@ -795,16 +986,28 @@ export class MCPServerManager {
         return runServerTest(
           { transport: "stdio", command: server.command },
           projectPath,
-          `server "${name}"`
+          `server "${trimmedName}"`
         );
       }
 
       try {
         const resolved = resolveHeaders(server.headers, projectSecrets);
-        return runServerTest(
-          { transport: server.transport, url: server.url, headers: resolved.headers },
+
+        const authProvider = await this.mcpOauthService?.getAuthProviderForServer({
           projectPath,
-          `server "${name}"`
+          serverName: trimmedName,
+          serverUrl: server.url,
+        });
+
+        return runServerTest(
+          {
+            transport: server.transport,
+            url: server.url,
+            headers: resolved.headers,
+            ...(authProvider ? { authProvider } : {}),
+          },
+          projectPath,
+          `server "${trimmedName}"`
         );
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -820,6 +1023,8 @@ export class MCPServerManager {
     }
 
     if (url?.trim()) {
+      const serverUrl = url.trim();
+
       if (transport !== "http" && transport !== "sse" && transport !== "auto") {
         return { success: false, error: "transport must be http|sse|auto when testing by url" };
       }
@@ -830,7 +1035,24 @@ export class MCPServerManager {
 
       try {
         const resolved = resolveHeaders(headers, projectSecrets);
-        return runServerTest({ transport, url, headers: resolved.headers }, projectPath, "url");
+
+        const authProvider = trimmedName
+          ? await this.mcpOauthService?.getAuthProviderForServer({
+              projectPath,
+              serverName: trimmedName,
+              serverUrl,
+            })
+          : undefined;
+        return runServerTest(
+          {
+            transport,
+            url: serverUrl,
+            headers: resolved.headers,
+            ...(authProvider ? { authProvider } : {}),
+          },
+          projectPath,
+          trimmedName ? `server "${trimmedName}" (url)` : "url"
+        );
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         return { success: false, error: message };
@@ -921,6 +1143,7 @@ export class MCPServerManager {
   private async startServers(
     servers: MCPServerMap,
     runtime: Runtime,
+    projectPath: string,
     workspacePath: string,
     projectSecrets: Record<string, string> | undefined,
     onActivity: () => void
@@ -934,6 +1157,7 @@ export class MCPServerManager {
           name,
           info,
           runtime,
+          projectPath,
           workspacePath,
           projectSecrets,
           onActivity
@@ -954,6 +1178,7 @@ export class MCPServerManager {
     name: string,
     info: MCPServerInfo,
     runtime: Runtime,
+    projectPath: string,
     workspacePath: string,
     projectSecrets: Record<string, string> | undefined,
     onActivity: () => void
@@ -1026,12 +1251,26 @@ export class MCPServerManager {
 
     const { headers } = resolveHeaders(info.headers, projectSecrets);
 
+    // Only attach authProvider when we have stored OAuth tokens for this server.
+    // Passing an authProvider with no tokens can trigger user-interactive auth flows
+    // on background MCP calls (undesirable).
+    const authProvider = await this.mcpOauthService?.getAuthProviderForServer({
+      projectPath,
+      serverName: name,
+      serverUrl: info.url,
+    });
+
+    const transportBase = {
+      url: info.url,
+      headers,
+      ...(authProvider ? { authProvider } : {}),
+    };
+
     const tryHttp = async () =>
       experimental_createMCPClient({
         transport: {
           type: "http",
-          url: info.url,
-          headers,
+          ...transportBase,
         },
       });
 
@@ -1039,8 +1278,7 @@ export class MCPServerManager {
       experimental_createMCPClient({
         transport: {
           type: "sse",
-          url: info.url,
-          headers,
+          ...transportBase,
         },
       });
 

@@ -210,6 +210,14 @@ export const muxGateway = {
   },
 };
 
+const MCPOAuthPendingServerSchema = z
+  .object({
+    // OAuth is only supported for remote transports.
+    transport: z.union([z.literal("http"), z.literal("sse"), z.literal("auto")]),
+    url: z.string(),
+  })
+  .strict();
+
 // Projects
 export const projects = {
   create: {
@@ -282,6 +290,93 @@ export const projects = {
       output: ResultSchema(z.void(), z.string()),
     },
   },
+  mcpOauth: {
+    startDesktopFlow: {
+      input: z
+        .object({
+          projectPath: z.string(),
+          serverName: z.string(),
+          pendingServer: MCPOAuthPendingServerSchema.optional(),
+        })
+        .strict(),
+      output: ResultSchema(
+        z.object({
+          flowId: z.string(),
+          authorizeUrl: z.string(),
+          redirectUri: z.string(),
+        }),
+        z.string()
+      ),
+    },
+    waitForDesktopFlow: {
+      input: z
+        .object({
+          flowId: z.string(),
+          timeoutMs: z.number().int().positive().optional(),
+        })
+        .strict(),
+      output: ResultSchema(z.void(), z.string()),
+    },
+    cancelDesktopFlow: {
+      input: z.object({ flowId: z.string() }).strict(),
+      output: z.void(),
+    },
+    startServerFlow: {
+      input: z
+        .object({
+          projectPath: z.string(),
+          serverName: z.string(),
+          pendingServer: MCPOAuthPendingServerSchema.optional(),
+        })
+        .strict(),
+      output: ResultSchema(
+        z.object({
+          flowId: z.string(),
+          authorizeUrl: z.string(),
+          redirectUri: z.string(),
+        }),
+        z.string()
+      ),
+    },
+    waitForServerFlow: {
+      input: z
+        .object({
+          flowId: z.string(),
+          timeoutMs: z.number().int().positive().optional(),
+        })
+        .strict(),
+      output: ResultSchema(z.void(), z.string()),
+    },
+    cancelServerFlow: {
+      input: z.object({ flowId: z.string() }).strict(),
+      output: z.void(),
+    },
+    getAuthStatus: {
+      input: z
+        .object({
+          projectPath: z.string(),
+          serverName: z.string(),
+        })
+        .strict(),
+      output: z.object({
+        serverUrl: z.string().optional(),
+        isLoggedIn: z.boolean(),
+        hasRefreshToken: z.boolean(),
+        scope: z.string().optional(),
+        updatedAtMs: z.number().optional(),
+      }),
+    },
+    logout: {
+      input: z
+        .object({
+          projectPath: z.string(),
+          serverName: z.string(),
+        })
+        .strict(),
+      output: ResultSchema(z.void(), z.string()),
+    },
+  },
+
   secrets: {
     get: {
       input: z.object({ projectPath: z.string() }),

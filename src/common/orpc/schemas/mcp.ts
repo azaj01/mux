@@ -111,6 +111,9 @@ export const MCPSetToolAllowlistParamsSchema = z.object({
  * - name (to test a configured server), OR
  * - command (to test arbitrary stdio command), OR
  * - url+transport (to test arbitrary http/sse/auto endpoint)
+ *
+ * For pending-server tests (e.g. add-server form), callers may also provide
+ * name+url+transport so the backend can attach stored OAuth credentials.
  */
 export const MCPTestParamsSchema = z
   .object({
@@ -123,15 +126,19 @@ export const MCPTestParamsSchema = z
     headers: MCPHeadersSchema.optional(),
   })
   .superRefine((input, ctx) => {
-    if (input.name?.trim()) {
+    const hasName = Boolean(input.name?.trim());
+    const hasCommand = Boolean(input.command?.trim());
+    const hasUrl = Boolean(input.url?.trim());
+
+    if (!hasName && !hasCommand && !hasUrl) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Either name, command, or url is required",
+      });
       return;
     }
 
-    if (input.command?.trim()) {
-      return;
-    }
-
-    if (input.url?.trim()) {
+    if (hasUrl) {
       const transport = input.transport;
       if (transport !== "http" && transport !== "sse" && transport !== "auto") {
         ctx.addIssue({
@@ -139,16 +146,19 @@ export const MCPTestParamsSchema = z
           message: "transport must be http|sse|auto when testing by url",
         });
       }
-      return;
     }
-
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: "Either name, command, or url is required",
-    });
   });
+
+export const BearerChallengeSchema = z.object({
+  scope: z.string().optional(),
+  resourceMetadataUrl: z.url().optional(),
+});
 
 export const MCPTestResultSchema = z.discriminatedUnion("success", [
   z.object({ success: z.literal(true), tools: z.array(z.string()) }),
-  z.object({ success: z.literal(false), error: z.string() }),
+  z.object({
+    success: z.literal(false),
+    error: z.string(),
+    oauthChallenge: BearerChallengeSchema.optional(),
+  }),
 ]);

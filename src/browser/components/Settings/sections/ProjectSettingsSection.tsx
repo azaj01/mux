@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { useAPI } from "@/browser/contexts/API";
 import { useSettings } from "@/browser/contexts/SettingsContext";
@@ -14,6 +14,7 @@ import {
   Pencil,
   Check,
   X,
+  LogIn,
   ChevronDown,
   ChevronRight,
 } from "lucide-react";
@@ -27,9 +28,11 @@ import {
 } from "@/browser/components/ui/select";
 import { createEditKeyHandler } from "@/browser/utils/ui/keybinds";
 import { Switch } from "@/browser/components/ui/switch";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/ui/tooltip";
 import { cn } from "@/common/lib/utils";
 import { formatRelativeTime } from "@/browser/utils/ui/dateTime";
 import type { CachedMCPTestResult, MCPServerInfo, MCPServerTransport } from "@/common/types/mcp";
+import type { MCPOAuthPendingServerConfig } from "@/common/types/mcpOauth";
 import { useMCPTestCache } from "@/browser/hooks/useMCPTestCache";
 import { MCPHeadersEditor } from "@/browser/components/MCPHeadersEditor";
 import {
@@ -38,6 +41,7 @@ import {
   type MCPHeaderRow,
 } from "@/browser/utils/mcpHeaders";
 import { ToolSelector } from "@/browser/components/ToolSelector";
+import { KebabMenu, type KebabMenuItem } from "@/browser/components/KebabMenu";
 
 /** Component for managing tool allowlist for a single MCP server */
 const ToolAllowlistSection: React.FC<{
@@ -174,6 +178,554 @@ const ToolAllowlistSection: React.FC<{
   );
 };
 
+type MCPOAuthLoginStatus = "idle" | "starting" | "waiting" | "success" | "error";
+
+interface MCPOAuthAuthStatus {
+  serverUrl?: string;
+  isLoggedIn: boolean;
+  hasRefreshToken: boolean;
+  scope?: string;
+  updatedAtMs?: number;
+}
+
+type MCPOAuthAPI = NonNullable<ReturnType<typeof useAPI>["api"]>["projects"]["mcpOauth"];
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  // In dev-server (browser) mode, the ORPC client can surface namespaces/procedures as Proxy
+  // functions (callable objects). Treat functions as record-like so runtime guards don't
+  // incorrectly report "OAuth is not available".
+  if (value === null) return false;
+  const type = typeof value;
+  return type === "object" || type === "function";
+}
+
+/**
+ * Defensive runtime guard: `projects.mcpOauth` may not exist when running against older backends
+ * or in non-desktop environments. Treat OAuth as unavailable instead of surfacing raw exceptions.
+ */
+function getMCPOAuthAPI(api: ReturnType<typeof useAPI>["api"]): MCPOAuthAPI | null {
+  if (!api) return null;
+
+  // Avoid direct property access since `api.projects.mcpOauth` may be missing at runtime.
+  const maybeOauth: unknown = Reflect.get(api.projects, "mcpOauth");
+  if (!isRecord(maybeOauth)) return null;
+
+  const requiredFns = ["getAuthStatus", "logout"] as const;
+
+  for (const fn of requiredFns) {
+    if (typeof maybeOauth[fn] !== "function") {
+      return null;
+    }
+  }
+
+  // Login flow support depends on whether the client can complete the callback.
+  const hasDesktopFlowFns =
+    typeof maybeOauth.startDesktopFlow === "function" &&
+    typeof maybeOauth.waitForDesktopFlow === "function" &&
+    typeof maybeOauth.cancelDesktopFlow === "function";
+
+  const hasServerFlowFns =
+    typeof maybeOauth.startServerFlow === "function" &&
+    typeof maybeOauth.waitForServerFlow === "function" &&
+    typeof maybeOauth.cancelServerFlow === "function";
+
+  if (!hasDesktopFlowFns && !hasServerFlowFns) {
+    return null;
+  }
+
+  return maybeOauth as unknown as MCPOAuthAPI;
+}
+
+type MCPOAuthLoginFlowMode = "desktop" | "server";
+
+function getMCPOAuthLoginFlowMode(input: {
+  isDesktop: boolean;
+  mcpOauthApi: MCPOAuthAPI | null;
+}): MCPOAuthLoginFlowMode | null {
+  const api = input.mcpOauthApi;
+  if (!api || !isRecord(api)) {
+    return null;
+  }
+
+  const hasDesktopFlowFns =
+    typeof api.startDesktopFlow === "function" &&
+    typeof api.waitForDesktopFlow === "function" &&
+    typeof api.cancelDesktopFlow === "function";
+
+  const hasServerFlowFns =
+    typeof api.startServerFlow === "function" &&
+    typeof api.waitForServerFlow === "function" &&
+    typeof api.cancelServerFlow === "function";
+
+  if (input.isDesktop) {
+    return hasDesktopFlowFns ? "desktop" : null;
+  }
+
+  return hasServerFlowFns ? "server" : null;
+}
+
+function useMCPOAuthLogin(input: {
+  api: ReturnType<typeof useAPI>["api"];
+  isDesktop: boolean;
+  projectPath: string;
+  serverName: string;
+  pendingServer?: MCPOAuthPendingServerConfig;
+  onSuccess?: () => void | Promise<void>;
+}) {
+  const { api, isDesktop, projectPath, serverName, pendingServer, onSuccess } = input;
+  const loginAttemptRef = useRef(0);
+  const [flowId, setFlowId] = useState<string | null>(null);
+
+  const [loginStatus, setLoginStatus] = useState<MCPOAuthLoginStatus>("idle");
+  const [loginError, setLoginError] = useState<string | null>(null);
+
+  const loginInProgress = loginStatus === "starting" || loginStatus === "waiting";
+
+  const cancelLogin = useCallback(() => {
+    loginAttemptRef.current++;
+
+    const mcpOauthApi = getMCPOAuthAPI(api);
+    const loginFlowMode = getMCPOAuthLoginFlowMode({
+      isDesktop,
+      mcpOauthApi,
+    });
+
+    if (mcpOauthApi && flowId && loginFlowMode === "desktop") {
+      void mcpOauthApi.cancelDesktopFlow({ flowId });
+    }
+
+    if (mcpOauthApi && flowId && loginFlowMode === "server") {
+      void mcpOauthApi.cancelServerFlow({ flowId });
+    }
+
+    setFlowId(null);
+    setLoginStatus("idle");
+    setLoginError(null);
+  }, [api, flowId, isDesktop]);
+
+  const startLogin = useCallback(async () => {
+    const attempt = ++loginAttemptRef.current;
+
+    try {
+      setLoginError(null);
+      setFlowId(null);
+
+      if (!api) {
+        setLoginStatus("error");
+        setLoginError("Mux API not connected.");
+        return;
+      }
+
+      if (!serverName.trim()) {
+        setLoginStatus("error");
+        setLoginError("Server name is required to start OAuth login.");
+        return;
+      }
+
+      const mcpOauthApi = getMCPOAuthAPI(api);
+      if (!mcpOauthApi) {
+        setLoginStatus("error");
+        setLoginError("OAuth is not available in this environment.");
+        return;
+      }
+
+      const loginFlowMode = getMCPOAuthLoginFlowMode({
+        isDesktop,
+        mcpOauthApi,
+      });
+      if (!loginFlowMode) {
+        setLoginStatus("error");
+        setLoginError("OAuth login is not available in this environment.");
+        return;
+      }
+
+      setLoginStatus("starting");
+
+      const startResult =
+        loginFlowMode === "desktop"
+          ? await mcpOauthApi.startDesktopFlow({ projectPath, serverName, pendingServer })
+          : await mcpOauthApi.startServerFlow({ projectPath, serverName, pendingServer });
+
+      if (attempt !== loginAttemptRef.current) {
+        if (startResult.success) {
+          if (loginFlowMode === "desktop") {
+            void mcpOauthApi.cancelDesktopFlow({ flowId: startResult.data.flowId });
+          } else {
+            void mcpOauthApi.cancelServerFlow({ flowId: startResult.data.flowId });
+          }
+        }
+        return;
+      }
+
+      if (!startResult.success) {
+        setLoginStatus("error");
+        setLoginError(startResult.error);
+        return;
+      }
+
+      const { flowId: nextFlowId, authorizeUrl } = startResult.data;
+      setFlowId(nextFlowId);
+      setLoginStatus("waiting");
+
+      // Desktop main process intercepts external window.open() calls and routes them via shell.openExternal.
+      // In browser mode, this opens a new tab/window.
+      //
+      // NOTE: In some browsers (especially when using `noopener`), `window.open()` may return null even when
+      // the tab opens successfully. Do not treat a null return value as a failure signal; keep the OAuth flow
+      // alive and show guidance to the user while we wait.
+      try {
+        window.open(authorizeUrl, "_blank", "noopener");
+      } catch {
+        // Popups can be blocked or restricted by the browser. The user can cancel and retry after allowing
+        // popups; we intentionally do not auto-cancel the server flow here.
+      }
+
+      if (attempt !== loginAttemptRef.current) {
+        return;
+      }
+
+      const waitResult =
+        loginFlowMode === "desktop"
+          ? await mcpOauthApi.waitForDesktopFlow({ flowId: nextFlowId })
+          : await mcpOauthApi.waitForServerFlow({ flowId: nextFlowId });
+
+      if (attempt !== loginAttemptRef.current) {
+        return;
+      }
+
+      if (waitResult.success) {
+        setLoginStatus("success");
+        await onSuccess?.();
+        return;
+      }
+
+      setLoginStatus("error");
+      setLoginError(waitResult.error);
+    } catch (err) {
+      if (attempt !== loginAttemptRef.current) {
+        return;
+      }
+
+      const message = err instanceof Error ? err.message : String(err);
+      setLoginStatus("error");
+      setLoginError(message);
+    }
+  }, [api, isDesktop, onSuccess, pendingServer, projectPath, serverName]);
+
+  return {
+    loginStatus,
+    loginError,
+    loginInProgress,
+    startLogin,
+    cancelLogin,
+  };
+}
+
+const MCPOAuthRequiredCallout: React.FC<{
+  projectPath: string;
+  serverName: string;
+  pendingServer?: MCPOAuthPendingServerConfig;
+  disabledReason?: string;
+  onLoginSuccess?: () => void | Promise<void>;
+}> = ({ projectPath, serverName, pendingServer, disabledReason, onLoginSuccess }) => {
+  const { api } = useAPI();
+  const isDesktop = !!window.api;
+
+  const { loginStatus, loginError, loginInProgress, startLogin, cancelLogin } = useMCPOAuthLogin({
+    api,
+    isDesktop,
+    projectPath,
+    serverName,
+    pendingServer,
+    onSuccess: onLoginSuccess,
+  });
+
+  const mcpOauthApi = getMCPOAuthAPI(api);
+  const loginFlowMode = getMCPOAuthLoginFlowMode({
+    isDesktop,
+    mcpOauthApi,
+  });
+
+  const disabledTitle =
+    disabledReason ??
+    (!api
+      ? "Mux API not connected"
+      : !mcpOauthApi
+        ? "OAuth is not available in this environment."
+        : !loginFlowMode
+          ? isDesktop
+            ? "OAuth login is not available in this environment."
+            : "OAuth login is only available in the desktop app."
+          : undefined);
+
+  const loginDisabled = Boolean(disabledReason) || !api || !loginFlowMode || loginInProgress;
+
+  const loginButton = (
+    <Button
+      size="sm"
+      onClick={() => {
+        void startLogin();
+      }}
+      disabled={loginDisabled}
+      aria-label="Login via OAuth"
+    >
+      {loginInProgress ? (
+        <>
+          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          Waiting for login...
+        </>
+      ) : (
+        "Login via OAuth"
+      )}
+    </Button>
+  );
+
+  return (
+    <div className="bg-warning/10 border-warning/30 text-warning rounded-md border px-3 py-2 text-xs">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="font-medium">This server requires OAuth.</p>
+          {disabledReason && <p className="text-muted mt-0.5">{disabledReason}</p>}
+
+          {loginStatus === "waiting" && (
+            <>
+              <p className="text-muted mt-0.5">
+                Finish the login flow in your browser, then return here.
+              </p>
+              {!isDesktop && (
+                <p className="text-muted mt-0.5">
+                  If a new tab didn&apos;t open, your browser may have blocked the popup. Allow
+                  popups and try again.
+                </p>
+              )}
+            </>
+          )}
+
+          {loginStatus === "success" && <p className="text-muted mt-0.5">Logged in.</p>}
+
+          {loginStatus === "error" && loginError && (
+            <p className="text-destructive mt-0.5">OAuth error: {loginError}</p>
+          )}
+        </div>
+
+        <div className="flex shrink-0 items-center gap-2">
+          {disabledTitle ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="inline-flex">{loginButton}</span>
+              </TooltipTrigger>
+              <TooltipContent side="top">{disabledTitle}</TooltipContent>
+            </Tooltip>
+          ) : (
+            loginButton
+          )}
+
+          {loginStatus === "waiting" && (
+            <Button variant="secondary" size="sm" onClick={cancelLogin}>
+              Cancel
+            </Button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const RemoteMCPOAuthSection: React.FC<{
+  projectPath: string;
+  serverName: string;
+  transport: Exclude<MCPServerTransport, "stdio">;
+  url: string;
+  oauthRefreshNonce?: number;
+}> = ({ projectPath, serverName, transport, url, oauthRefreshNonce }) => {
+  const { api } = useAPI();
+  const isDesktop = !!window.api;
+
+  const [authStatus, setAuthStatus] = useState<MCPOAuthAuthStatus | null>(null);
+  const [authStatusLoading, setAuthStatusLoading] = useState(false);
+  const [authStatusError, setAuthStatusError] = useState<string | null>(null);
+
+  const [logoutInProgress, setLogoutInProgress] = useState(false);
+  const [logoutError, setLogoutError] = useState<string | null>(null);
+
+  const refreshAuthStatus = useCallback(async () => {
+    const mcpOauthApi = getMCPOAuthAPI(api);
+    if (!mcpOauthApi) {
+      setAuthStatus(null);
+      setAuthStatusLoading(false);
+      setAuthStatusError(null);
+      return;
+    }
+
+    setAuthStatusLoading(true);
+    setAuthStatusError(null);
+
+    try {
+      const status = await mcpOauthApi.getAuthStatus({ projectPath, serverName });
+      setAuthStatus(status);
+    } catch (err) {
+      setAuthStatus(null);
+      setAuthStatusError(err instanceof Error ? err.message : "Failed to load OAuth status");
+    } finally {
+      setAuthStatusLoading(false);
+    }
+  }, [api, projectPath, serverName]);
+
+  useEffect(() => {
+    void refreshAuthStatus();
+  }, [refreshAuthStatus, transport, url, oauthRefreshNonce]);
+
+  const { loginStatus, loginError, loginInProgress, startLogin, cancelLogin } = useMCPOAuthLogin({
+    api,
+    isDesktop,
+    projectPath,
+    serverName,
+    onSuccess: refreshAuthStatus,
+  });
+
+  const mcpOauthApi = getMCPOAuthAPI(api);
+  const oauthAvailable = Boolean(mcpOauthApi);
+  const loginFlowMode = getMCPOAuthLoginFlowMode({ isDesktop, mcpOauthApi });
+  const oauthActionsAvailable = oauthAvailable && Boolean(loginFlowMode);
+
+  const isLoggedIn = (authStatus?.isLoggedIn ?? false) || loginStatus === "success";
+
+  const oauthDebugErrors = [
+    authStatusError ? { label: "Status", message: authStatusError } : null,
+    loginStatus === "error" && loginError ? { label: "Login", message: loginError } : null,
+    logoutError ? { label: "Logout", message: logoutError } : null,
+  ].filter((entry): entry is { label: string; message: string } => entry !== null);
+
+  const authStatusText = !oauthAvailable
+    ? "Not available"
+    : authStatusLoading
+      ? "Checking..."
+      : loginInProgress
+        ? "Waiting..."
+        : oauthDebugErrors.length > 0
+          ? "Error"
+          : isLoggedIn
+            ? "Logged in"
+            : "Not logged in";
+
+  const updatedAtText =
+    oauthAvailable && isLoggedIn && authStatus?.updatedAtMs
+      ? ` (${formatRelativeTime(authStatus.updatedAtMs)})`
+      : "";
+
+  const loginButtonLabel = loginStatus === "error" ? "Retry" : "Login";
+  const reloginMenuLabel = loginStatus === "error" ? "Retry login" : "Re-login";
+
+  const logout = useCallback(async () => {
+    const mcpOauthApi = getMCPOAuthAPI(api);
+    if (!mcpOauthApi) {
+      setLogoutError("OAuth is not available in this environment.");
+      return;
+    }
+
+    setLogoutError(null);
+    cancelLogin();
+    setLogoutInProgress(true);
+
+    try {
+      const result = await mcpOauthApi.logout({ projectPath, serverName });
+      if (!result.success) {
+        setLogoutError(result.error);
+        return;
+      }
+
+      await refreshAuthStatus();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setLogoutError(message);
+    } finally {
+      setLogoutInProgress(false);
+    }
+  }, [api, cancelLogin, projectPath, refreshAuthStatus, serverName]);
+
+  return (
+    <div className="mt-1 flex items-center justify-between gap-2">
+      <div className="flex min-w-0 items-center gap-2 text-xs">
+        <span className="text-foreground font-medium">OAuth</span>
+        <span className="text-muted truncate">
+          {authStatusText}
+          {updatedAtText}
+        </span>
+
+        {oauthDebugErrors.length > 0 && (
+          <details className="group inline-block">
+            <summary className="text-muted hover:text-foreground cursor-pointer list-none text-[11px] underline-offset-2 group-open:underline">
+              Details
+            </summary>
+            <div className="border-border-medium bg-background-secondary mt-1 space-y-1 rounded-md border px-2 py-1 text-xs">
+              {oauthDebugErrors.map((entry) => (
+                <div key={entry.label} className="text-destructive break-words">
+                  <span className="font-medium">{entry.label}:</span> {entry.message}
+                </div>
+              ))}
+            </div>
+          </details>
+        )}
+      </div>
+
+      {oauthActionsAvailable && (
+        <div className="flex shrink-0 items-center gap-1">
+          {loginInProgress ? (
+            <>
+              <Button variant="outline" size="sm" className="h-7 px-2" disabled>
+                <Loader2 className="h-3 w-3 animate-spin" />
+                {isLoggedIn ? "Re-login" : "Login"}
+              </Button>
+
+              <Button variant="ghost" size="sm" className="h-7 px-2" onClick={cancelLogin}>
+                Cancel
+              </Button>
+            </>
+          ) : isLoggedIn ? (
+            <>
+              {logoutInProgress && <Loader2 className="text-muted h-3 w-3 animate-spin" />}
+              <KebabMenu
+                className="h-7 w-7 px-0 text-xs"
+                items={
+                  [
+                    {
+                      label: reloginMenuLabel,
+                      onClick: () => {
+                        void startLogin();
+                      },
+                      disabled: logoutInProgress,
+                    },
+                    {
+                      label: logoutInProgress ? "Logging out..." : "Logout",
+                      onClick: () => {
+                        void logout();
+                      },
+                      disabled: logoutInProgress,
+                    },
+                  ] satisfies KebabMenuItem[]
+                }
+              />
+            </>
+          ) : (
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 px-2"
+              onClick={() => {
+                void startLogin();
+              }}
+              disabled={logoutInProgress}
+            >
+              <LogIn />
+              {loginButtonLabel}
+            </Button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
 export const ProjectSettingsSection: React.FC = () => {
   const { api } = useAPI();
   const policyState = usePolicy();
@@ -201,6 +753,7 @@ export const ProjectSettingsSection: React.FC = () => {
     clearResult: clearTestResult,
   } = useMCPTestCache(selectedProject);
   const [testingServer, setTestingServer] = useState<string | null>(null);
+  const [mcpOauthRefreshNonce, setMcpOauthRefreshNonce] = useState(0);
 
   interface EditableServer {
     name: string;
@@ -421,11 +974,14 @@ export const ProjectSettingsSection: React.FC = () => {
         throw new Error(validation.errors[0]);
       }
 
+      const pendingName = newServer.name.trim();
+
       const result = await api.projects.mcp.test({
         projectPath: selectedProject,
         ...(newServer.transport === "stdio"
           ? { command: newServer.value.trim() }
           : {
+              ...(pendingName ? { name: pendingName } : {}),
               transport: newServer.transport,
               url: newServer.value.trim(),
               headers,
@@ -444,6 +1000,7 @@ export const ProjectSettingsSection: React.FC = () => {
   }, [
     api,
     selectedProject,
+    newServer.name,
     newServer.transport,
     newServer.value,
     newServer.headersRows,
@@ -452,14 +1009,21 @@ export const ProjectSettingsSection: React.FC = () => {
 
   const handleAddServer = useCallback(async () => {
     if (!api || !selectedProject || !newServer.name.trim() || !newServer.value.trim()) return;
+
+    const serverName = newServer.name.trim();
+    const serverTransport = newServer.transport;
+    const serverValue = newServer.value.trim();
+    const serverHeadersRows = newServer.headersRows;
+    const existingTestResult = newTestResult;
+
     setAddingServer(true);
     setError(null);
 
     try {
       const { headers, validation } =
-        newServer.transport === "stdio"
+        serverTransport === "stdio"
           ? { headers: undefined, validation: { errors: [], warnings: [] } }
-          : mcpHeaderRowsToRecord(newServer.headersRows, {
+          : mcpHeaderRowsToRecord(serverHeadersRows, {
               knownSecretKeys: new Set(projectSecretKeys),
             });
 
@@ -469,26 +1033,49 @@ export const ProjectSettingsSection: React.FC = () => {
 
       const result = await api.projects.mcp.add({
         projectPath: selectedProject,
-        name: newServer.name.trim(),
-        ...(newServer.transport === "stdio"
-          ? { transport: "stdio", command: newServer.value.trim() }
+        name: serverName,
+        ...(serverTransport === "stdio"
+          ? { transport: "stdio", command: serverValue }
           : {
-              transport: newServer.transport,
-              url: newServer.value.trim(),
+              transport: serverTransport,
+              url: serverValue,
               headers,
             }),
       });
 
       if (!result.success) {
         setError(result.error ?? "Failed to add MCP server");
-      } else {
-        // Cache the test result if we have one
-        if (newTestResult?.result.success) {
-          cacheTestResult(newServer.name.trim(), newTestResult.result);
+        return;
+      }
+
+      setNewServer({ name: "", transport: "stdio", value: "", headersRows: [] });
+      setNewTestResult(null);
+      await refresh();
+
+      // For stdio, avoid running arbitrary user-provided commands automatically.
+      if (serverTransport === "stdio") {
+        if (existingTestResult?.result.success) {
+          cacheTestResult(serverName, existingTestResult.result);
         }
-        setNewServer({ name: "", transport: "stdio", value: "", headersRows: [] });
-        setNewTestResult(null);
-        await refresh();
+        return;
+      }
+
+      // For remote servers, always run a test immediately after adding so OAuth-required servers can
+      // surface an OAuth callout without requiring a manual Test click.
+      setTestingServer(serverName);
+      try {
+        const testResult = await api.projects.mcp.test({
+          projectPath: selectedProject,
+          name: serverName,
+        });
+        cacheTestResult(serverName, testResult);
+      } catch (err) {
+        cacheTestResult(serverName, {
+          success: false,
+          error: err instanceof Error ? err.message : "Test failed",
+        });
+      } finally {
+        setTestingServer(null);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to add MCP server");
@@ -648,28 +1235,43 @@ export const ProjectSettingsSection: React.FC = () => {
                   const cached = testCache[name];
                   const isEditing = editing?.name === name;
                   const isEnabled = !entry.disabled;
+                  const remoteEntry = entry.transport === "stdio" ? null : entry;
                   return (
                     <div
                       key={name}
                       className="border-border-medium bg-background-secondary overflow-hidden rounded-md border"
                     >
-                      <div className="flex items-start gap-3 px-3 py-2.5">
-                        <Switch
-                          checked={isEnabled}
-                          onCheckedChange={(checked) => void handleToggleEnabled(name, checked)}
-                          title={isEnabled ? "Disable server" : "Enable server"}
-                          className="mt-0.5 shrink-0"
-                        />
-                        <div className={cn("min-w-0 flex-1", !isEnabled && "opacity-50")}>
+                      <div className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-x-3 px-3 py-2">
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <div className="mt-0.5 shrink-0">
+                              <Switch
+                                checked={isEnabled}
+                                onCheckedChange={(checked) =>
+                                  void handleToggleEnabled(name, checked)
+                                }
+                                aria-label={`Toggle ${name} enabled`}
+                              />
+                            </div>
+                          </TooltipTrigger>
+                          <TooltipContent side="top">
+                            {isEnabled ? "Disable server" : "Enable server"}
+                          </TooltipContent>
+                        </Tooltip>
+                        <div className={cn("min-w-0", !isEnabled && "opacity-50")}>
                           <div className="flex items-center gap-2">
                             <span className="text-foreground text-sm font-medium">{name}</span>
                             {cached?.result.success && !isEditing && isEnabled && (
-                              <span
-                                className="rounded bg-green-500/10 px-1.5 py-0.5 text-xs text-green-500"
-                                title={`Tested ${formatRelativeTime(cached.testedAt)}`}
-                              >
-                                {cached.result.tools.length} tools
-                              </span>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <span className="rounded bg-green-500/10 px-1.5 py-0.5 text-xs text-green-500">
+                                    {cached.result.tools.length} tools
+                                  </span>
+                                </TooltipTrigger>
+                                <TooltipContent side="top">
+                                  Tested {formatRelativeTime(cached.testedAt)}
+                                </TooltipContent>
+                              </Tooltip>
                             )}
                             {!isEnabled && <span className="text-muted text-xs">disabled</span>}
                           </div>
@@ -716,80 +1318,149 @@ export const ProjectSettingsSection: React.FC = () => {
                         <div className="flex shrink-0 items-center gap-0.5">
                           {isEditing ? (
                             <>
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                onClick={() => void handleSaveEdit()}
-                                disabled={
-                                  savingEdit ||
-                                  !editing.value.trim() ||
-                                  editHeadersValidation.errors.length > 0
-                                }
-                                className="h-7 w-7 text-green-500 hover:text-green-400"
-                                title="Save (Enter)"
-                              >
-                                {savingEdit ? (
-                                  <Loader2 className="h-4 w-4 animate-spin" />
-                                ) : (
-                                  <Check className="h-4 w-4" />
-                                )}
-                              </Button>
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                onClick={handleCancelEdit}
-                                disabled={savingEdit}
-                                className="text-muted hover:text-foreground h-7 w-7"
-                                title="Cancel (Esc)"
-                              >
-                                <X className="h-4 w-4" />
-                              </Button>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <span className="inline-flex">
+                                    <Button
+                                      variant="ghost"
+                                      size="icon"
+                                      onClick={() => void handleSaveEdit()}
+                                      disabled={
+                                        savingEdit ||
+                                        !editing.value.trim() ||
+                                        editHeadersValidation.errors.length > 0
+                                      }
+                                      className="h-7 w-7 text-green-500 hover:text-green-400"
+                                      aria-label="Save"
+                                    >
+                                      {savingEdit ? (
+                                        <Loader2 className="h-4 w-4 animate-spin" />
+                                      ) : (
+                                        <Check className="h-4 w-4" />
+                                      )}
+                                    </Button>
+                                  </span>
+                                </TooltipTrigger>
+                                <TooltipContent side="top">Save (Enter)</TooltipContent>
+                              </Tooltip>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <span className="inline-flex">
+                                    <Button
+                                      variant="ghost"
+                                      size="icon"
+                                      onClick={handleCancelEdit}
+                                      disabled={savingEdit}
+                                      className="text-muted hover:text-foreground h-7 w-7"
+                                      aria-label="Cancel"
+                                    >
+                                      <X className="h-4 w-4" />
+                                    </Button>
+                                  </span>
+                                </TooltipTrigger>
+                                <TooltipContent side="top">Cancel (Esc)</TooltipContent>
+                              </Tooltip>
                             </>
                           ) : (
                             <>
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                onClick={() => void handleTest(name)}
-                                disabled={isTesting}
-                                className="text-muted hover:text-accent h-7 w-7"
-                                title="Test connection"
-                              >
-                                {isTesting ? (
-                                  <Loader2 className="h-4 w-4 animate-spin" />
-                                ) : (
-                                  <Play className="h-4 w-4" />
-                                )}
-                              </Button>
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                onClick={() => handleStartEdit(name, entry)}
-                                className="text-muted hover:text-accent h-7 w-7"
-                                title="Edit server"
-                              >
-                                <Pencil className="h-4 w-4" />
-                              </Button>
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                onClick={() => void handleRemove(name)}
-                                disabled={loading}
-                                className="text-muted hover:text-error h-7 w-7"
-                                title="Remove server"
-                              >
-                                <Trash2 className="h-4 w-4" />
-                              </Button>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <span className="inline-flex">
+                                    <Button
+                                      variant="ghost"
+                                      size="icon"
+                                      onClick={() => void handleTest(name)}
+                                      disabled={isTesting}
+                                      className="text-muted hover:text-accent h-7 w-7"
+                                      aria-label="Test connection"
+                                    >
+                                      {isTesting ? (
+                                        <Loader2 className="h-4 w-4 animate-spin" />
+                                      ) : (
+                                        <Play className="h-4 w-4" />
+                                      )}
+                                    </Button>
+                                  </span>
+                                </TooltipTrigger>
+                                <TooltipContent side="top">Test connection</TooltipContent>
+                              </Tooltip>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <span className="inline-flex">
+                                    <Button
+                                      variant="ghost"
+                                      size="icon"
+                                      onClick={() => handleStartEdit(name, entry)}
+                                      className="text-muted hover:text-accent h-7 w-7"
+                                      aria-label="Edit server"
+                                    >
+                                      <Pencil className="h-4 w-4" />
+                                    </Button>
+                                  </span>
+                                </TooltipTrigger>
+                                <TooltipContent side="top">Edit server</TooltipContent>
+                              </Tooltip>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <span className="inline-flex">
+                                    <Button
+                                      variant="ghost"
+                                      size="icon"
+                                      onClick={() => void handleRemove(name)}
+                                      disabled={loading}
+                                      className="text-muted hover:text-error h-7 w-7"
+                                      aria-label="Remove server"
+                                    >
+                                      <Trash2 className="h-4 w-4" />
+                                    </Button>
+                                  </span>
+                                </TooltipTrigger>
+                                <TooltipContent side="top">Remove server</TooltipContent>
+                              </Tooltip>
                             </>
                           )}
                         </div>
+                        {!isEditing && remoteEntry && (
+                          <div
+                            className={cn(
+                              "col-start-2 col-span-2 min-w-0",
+                              !isEnabled && "opacity-50"
+                            )}
+                          >
+                            <RemoteMCPOAuthSection
+                              projectPath={selectedProject}
+                              serverName={name}
+                              transport={remoteEntry.transport}
+                              url={remoteEntry.url}
+                              oauthRefreshNonce={mcpOauthRefreshNonce}
+                            />
+                          </div>
+                        )}
                       </div>
                       {cached && !cached.result.success && !isEditing && (
-                        <div className="border-border-medium text-destructive border-t px-3 py-2 text-xs">
-                          <div className="flex items-start gap-1.5">
+                        <div className="border-border-medium border-t px-3 py-2 text-xs">
+                          <div className="text-destructive flex items-start gap-1.5">
                             <XCircle className="mt-0.5 h-3 w-3 shrink-0" />
                             <span>{cached.result.error}</span>
                           </div>
+
+                          {cached.result.oauthChallenge && (
+                            <div className="mt-2">
+                              <MCPOAuthRequiredCallout
+                                projectPath={selectedProject}
+                                serverName={name}
+                                disabledReason={
+                                  remoteEntry
+                                    ? undefined
+                                    : "OAuth login is only supported for remote (http/sse) MCP servers."
+                                }
+                                onLoginSuccess={async () => {
+                                  setMcpOauthRefreshNonce((prev) => prev + 1);
+                                  await handleTest(name);
+                                }}
+                              />
+                            </div>
+                          )}
                         </div>
                       )}
                       {cached?.result.success && cached.result.tools.length > 0 && !isEditing && (
@@ -930,6 +1601,58 @@ export const ProjectSettingsSection: React.FC = () => {
                   </div>
                 )}
 
+                {newTestResult &&
+                  !newTestResult.result.success &&
+                  newTestResult.result.oauthChallenge && (
+                    <div className="mt-2">
+                      <MCPOAuthRequiredCallout
+                        projectPath={selectedProject}
+                        serverName={newServer.name.trim()}
+                        pendingServer={(() => {
+                          const pendingName = newServer.name.trim();
+                          if (!pendingName) {
+                            return undefined;
+                          }
+
+                          // If the server already exists in config, prefer that config for OAuth.
+                          const existing = servers[pendingName];
+                          if (existing) {
+                            return undefined;
+                          }
+
+                          if (newServer.transport === "stdio") {
+                            return undefined;
+                          }
+
+                          const url = newServer.value.trim();
+                          if (!url) {
+                            return undefined;
+                          }
+
+                          return { transport: newServer.transport, url };
+                        })()}
+                        disabledReason={(() => {
+                          const pendingName = newServer.name.trim();
+                          if (!pendingName) {
+                            return "Enter a server name to enable OAuth login.";
+                          }
+
+                          const existing = servers[pendingName];
+
+                          const transport = existing?.transport ?? newServer.transport;
+                          if (transport === "stdio") {
+                            return "OAuth login is only supported for remote (http/sse) MCP servers.";
+                          }
+
+                          return undefined;
+                        })()}
+                        onLoginSuccess={async () => {
+                          setMcpOauthRefreshNonce((prev) => prev + 1);
+                          await handleTestNewServer();
+                        }}
+                      />
+                    </div>
+                  )}
                 <div className="flex gap-2 pt-1">
                   <Button
                     variant="outline"
