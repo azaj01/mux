@@ -28,7 +28,12 @@ function filterAndMapSuggestions<T extends SuggestionDefinition>(
   return definitions
     .filter((definition) => {
       if (filter && !filter(definition)) return false;
-      return normalizedPartial ? definition.key.toLowerCase().startsWith(normalizedPartial) : true;
+      const normalizedKey = definition.key.toLowerCase();
+      // Keep full-prefix matches (e.g., /deep-r) alongside segment matches (e.g., /r).
+      return normalizedPartial
+        ? normalizedKey.startsWith(normalizedPartial) ||
+            normalizedKey.split("-").some((segment) => segment.startsWith(normalizedPartial))
+        : true;
     })
     .map((definition) => build(definition));
 }
