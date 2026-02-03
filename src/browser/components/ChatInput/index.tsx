@@ -2053,7 +2053,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           "relative flex flex-col gap-1",
           variant === "creation"
             ? "bg-separator w-full max-w-3xl rounded-lg border border-border-light px-6 py-5 shadow-lg"
-            : "bg-separator border-border-light border-t px-[15px] pt-[5px] pb-[max(15px,min(env(safe-area-inset-bottom,0px),40px))] mb-[calc(-1*min(env(safe-area-inset-bottom,0px),40px))]"
+            : "bg-separator border-border-light border-t px-[15px] pt-[5px] pb-[max(8px,min(env(safe-area-inset-bottom,0px),40px))] mb-[calc(-1*min(env(safe-area-inset-bottom,0px),40px))]"
         )}
         data-component="ChatInputSection"
         data-autofocus-state="done"
@@ -2192,11 +2192,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
               </div>
             )}
 
-            <div className="@container flex flex-wrap items-center gap-x-3 gap-y-1 [@container(max-width:480px)]:flex-col [@container(max-width:480px)]:items-stretch [@container(max-width:480px)]:gap-1">
-              {/* Row 1 on mobile: Model Selector + Thinking Slider */}
-              <div className="flex items-center gap-x-3 [@container(max-width:480px)]:w-full">
+            <div className="@container flex min-w-[340px] flex-nowrap items-center gap-2">
+              <div className="flex min-w-0 flex-1 items-center gap-2">
                 <div
-                  className="flex items-center gap-2"
+                  className="flex min-w-0 items-center gap-2"
                   data-component="ModelSelectorGroup"
                   data-tutorial="model-selector"
                 >
@@ -2210,6 +2209,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                     onSetDefaultModel={setDefaultModel}
                     hiddenModels={hiddenModels}
                     onOpenSettings={() => open("models")}
+                    className="w-[clamp(5.5rem,28vw,8rem)] min-w-0"
                   />
                   <div className="hidden [@media(hover:hover)_and_(pointer:fine)]:block">
                     <Tooltip>
@@ -2240,32 +2240,41 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                   </div>
                 </div>
 
-                {/* Thinking Slider - slider hidden on narrow containers, label always clickable */}
+                {/* Thinking: paddles hidden on narrow containers, label stays usable */}
                 <div
-                  className="flex items-center [&_.thinking-slider]:[@container(max-width:550px)]:hidden"
+                  className="flex shrink-0 items-center [&_[data-thinking-paddle]]:[@container(max-width:550px)]:hidden"
                   data-component="ThinkingSliderGroup"
                 >
                   <ThinkingSliderComponent modelString={baseModel} />
                 </div>
-                <div className="ml-4 flex items-center" data-component="ModelSettingsGroup">
+
+                <div className="flex items-center" data-component="ModelSettingsGroup">
                   <ModelSettings model={baseModel || ""} />
                 </div>
               </div>
 
-              {/* Row 2 on mobile: Context Usage + Agent Mode + Send Button */}
               <div
-                className="ml-auto flex items-center gap-2 [@container(max-width:480px)]:ml-0 [@container(max-width:480px)]:w-full [@container(max-width:480px)]:justify-end"
+                className="flex min-w-0 items-center justify-end gap-2"
                 data-component="ModelControls"
                 data-tutorial="mode-selector"
               >
                 {variant === "workspace" && (
-                  <ContextUsageIndicatorButton
-                    data={contextUsageData}
-                    autoCompaction={autoCompactionProps}
-                    idleCompaction={idleCompactionProps}
-                  />
+                  <div className="shrink">
+                    <ContextUsageIndicatorButton
+                      data={contextUsageData}
+                      autoCompaction={autoCompactionProps}
+                      idleCompaction={idleCompactionProps}
+                    />
+                  </div>
                 )}
-                <AgentModePicker onComplete={() => inputRef.current?.focus()} />
+
+                <div className="min-w-0 [@container(max-width:340px)]:hidden">
+                  <AgentModePicker
+                    className="min-w-0"
+                    onComplete={() => inputRef.current?.focus()}
+                  />
+                </div>
+
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <Button
@@ -2276,14 +2285,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                       style={{ backgroundColor: focusBorderColor }}
                       size="xs"
                       className={cn(
-                        "border-border-light inline-flex items-center justify-center rounded-sm border px-1.5 py-3 font-medium transition-colors duration-200 hover:brightness-110 disabled:opacity-50 disabled:hover:brightness-100",
-                        // Mobile: wider tap target + larger icon, keep icon centered.
-                        "[@container(max-width:480px)]:h-9 [@container(max-width:480px)]:w-11 [@container(max-width:480px)]:px-0 [@container(max-width:480px)]:py-0 [@container(max-width:480px)]:text-sm",
+                        "border-border-light inline-flex items-center justify-center rounded-sm border px-1.5 py-0.5 font-medium transition-colors duration-200 hover:brightness-110 disabled:opacity-50 disabled:hover:brightness-100",
+                        // Touch: wider tap target, keep icon centered.
+                        "[@media(hover:none)_and_(pointer:coarse)]:h-9 [@media(hover:none)_and_(pointer:coarse)]:w-11 [@media(hover:none)_and_(pointer:coarse)]:px-0 [@media(hover:none)_and_(pointer:coarse)]:py-0 [@media(hover:none)_and_(pointer:coarse)]:text-sm",
                         currentAgent?.uiColor ? "text-white" : "text-text"
                       )}
                     >
                       <SendHorizontal
-                        className="h-3.5 w-3.5 [@container(max-width:480px)]:h-4 [@container(max-width:480px)]:w-4"
+                        className="h-3.5 w-3.5 [@media(hover:none)_and_(pointer:coarse)]:h-4 [@media(hover:none)_and_(pointer:coarse)]:w-4"
                         strokeWidth={2.5}
                       />
                     </Button>
