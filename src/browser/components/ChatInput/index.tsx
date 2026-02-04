@@ -107,6 +107,7 @@ import { CreationControls } from "./CreationControls";
 import { useCreationWorkspace } from "./useCreationWorkspace";
 import { useCoderWorkspace } from "@/browser/hooks/useCoderWorkspace";
 import { useTutorial } from "@/browser/contexts/TutorialContext";
+import { usePowerMode } from "@/browser/contexts/PowerModeContext";
 import { useVoiceInput } from "@/browser/hooks/useVoiceInput";
 import { VoiceInputButton } from "./VoiceInputButton";
 import {
@@ -201,6 +202,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   })();
 
   const [input, setInput] = usePersistedState(storageKeys.inputKey, "", { listener: true });
+
+  // Keep a stable reference to the latest input value so event handlers don't need to rebind
+  // on same-length edits (e.g. selection-replace) to know the previous value.
+  const latestInputValueRef = useRef(input);
+  latestInputValueRef.current = input;
   // Track concurrent sends with a counter (not boolean) to handle queued follow-ups correctly.
   // When a follow-up is queued during stream-start, it resolves immediately but shouldn't
   // clear the "in flight" state until all sends complete.
@@ -315,6 +321,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   }, []);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const modelSelectorRef = useRef<ModelSelectorRef>(null);
+  const powerMode = usePowerMode();
   const [atMentionCursorNonce, setAtMentionCursorNonce] = useState(0);
   const lastAtMentionCursorRef = useRef<number | null>(null);
   const handleAtMentionCursorActivity = useCallback(() => {
@@ -331,6 +338,31 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     lastAtMentionCursorRef.current = nextCursor;
     setAtMentionCursorNonce((n) => n + 1);
   }, [input.length]);
+
+  const handleInputChange = useCallback(
+    (next: string) => {
+      if (powerMode.enabled) {
+        const prev = latestInputValueRef.current;
+        const delta = next.length - prev.length;
+        const el = inputRef.current;
+
+        if (el && next !== prev) {
+          // Power Mode should feel responsive on backspace/delete too.
+          if (delta > 0) {
+            powerMode.burstFromTextarea(el, Math.min(6, delta));
+          } else if (delta < 0) {
+            powerMode.burstFromTextarea(el, Math.min(6, -delta), "delete");
+          } else {
+            // Selection replace / overwrite with no net length change.
+            powerMode.burstFromTextarea(el, 1);
+          }
+        }
+      }
+
+      setInput(next);
+    },
+    [powerMode, setInput]
+  );
 
   // Draft state combines text input and attachments
   // Reviews are managed separately via props (persisted in pendingReviews state)
@@ -2131,7 +2163,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                   value={input}
                   isEditing={!!editingMessage}
                   focusBorderColor={focusBorderColor}
-                  onChange={setInput}
+                  onChange={handleInputChange}
                   onKeyDown={handleKeyDown}
                   onPaste={handlePaste}
                   onKeyUp={handleAtMentionCursorActivity}
