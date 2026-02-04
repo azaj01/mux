@@ -2014,7 +2014,15 @@ export class WorkspaceStore {
   ): void {
     // Handle non-buffered special events first
     if (isStreamError(data)) {
-      applyWorkspaceChatEventToAggregator(aggregator, data);
+      const transient = this.assertChatTransientState(workspaceId);
+
+      // Suppress side effects during buffered replay (we're just hydrating UI state), but allow
+      // live errors to trigger mux-gateway session-expired handling even before we're "caught up".
+      // In particular, mux-gateway 401s can surface as a pre-stream stream-error (before any
+      // stream-start) during startup/reconnect.
+      const allowSideEffects = !transient.replayingHistory;
+
+      applyWorkspaceChatEventToAggregator(aggregator, data, { allowSideEffects });
 
       // Increment retry attempt counter when stream fails.
       updatePersistedState(
