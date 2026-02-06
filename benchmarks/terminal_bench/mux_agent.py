@@ -32,8 +32,6 @@ class MuxAgent(BaseInstalledAgent):
         "tsconfig.main.json",
         "src",
         "dist",
-        # bun install runs package.json#postinstall; include the script so
-        # benchmark sandboxes don't fail with "cannot open scripts/postinstall.sh".
         "scripts/postinstall.sh",
     )
 
