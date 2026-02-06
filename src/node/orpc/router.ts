@@ -18,6 +18,7 @@ import type {
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { createAuthMiddleware } from "./authMiddleware";
 import { createAsyncMessageQueue } from "@/common/utils/asyncMessageQueue";
+import { createReplayBufferedStreamMessageRelay } from "./replayBufferedStreamMessageRelay";
 
 import { createRuntime, checkRuntimeAvailability } from "@/node/runtime/runtimeFactory";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
@@ -2581,14 +2582,25 @@ export const router = (authToken?: string) => {
           }
 
           // 1. Subscribe to new events (including those triggered by replay)
+          //
+          // IMPORTANT: We subscribe before replay so we can receive stream replay (`replayStream()`)
+          // and init replay events (which do not set `replay: true`).
+          //
+          // Live stream deltas can overlap with replayed deltas on reconnect. Buffer live stream
+          // events during replay and flush after `caught-up`, skipping any deltas already delivered
+          // by replay.
+          const replayRelay = createReplayBufferedStreamMessageRelay(push);
+
           const unsubscribe = session.onChatEvent(({ message }) => {
-            push(message);
+            replayRelay.handleSessionMessage(message);
           });
 
           // 2. Replay history (sends caught-up at the end)
           await session.replayHistory(({ message }) => {
             push(message);
           });
+
+          replayRelay.finishReplay();
 
           // 3. Heartbeat to keep the connection alive during long operations (tool calls, subagents).
           // Client uses this to detect stalled connections vs. intentionally idle streams.
