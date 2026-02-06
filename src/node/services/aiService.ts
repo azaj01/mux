@@ -37,6 +37,12 @@ import {
   MUX_GATEWAY_SUPPORTED_PROVIDERS,
   type ProviderName,
 } from "@/common/constants/providers";
+import {
+  CODEX_ENDPOINT,
+  isCodexOauthAllowedModelId,
+  isCodexOauthRequiredModelId,
+} from "@/common/constants/codexOAuth";
+import { parseCodexOauthAuth } from "@/node/utils/codexOauthAuth";
 
 import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 import type { BashOutputEvent } from "@/common/types/stream";
@@ -54,6 +60,7 @@ import { secretsToRecord } from "@/common/types/secrets";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import type { PolicyService } from "@/node/services/policyService";
 import type { ProviderService } from "@/node/services/providerService";
+import type { CodexOauthService } from "@/node/services/codexOauthService";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { FileState, EditedFileAttachment } from "@/node/services/agentSession";
 import { log } from "./log";
@@ -546,6 +553,42 @@ export async function discoverAvailableSubagentsForToolContext(args: {
   );
 }
 
+const MUX_MODEL_COSTS_INCLUDED = Symbol("mux:modelCostsIncluded");
+
+type LanguageModelWithMuxCostsIncluded = LanguageModel & {
+  [MUX_MODEL_COSTS_INCLUDED]?: true;
+};
+
+function markModelCostsIncluded(model: LanguageModel): void {
+  (model as LanguageModelWithMuxCostsIncluded)[MUX_MODEL_COSTS_INCLUDED] = true;
+}
+
+function modelCostsIncluded(model: LanguageModel): boolean {
+  return (model as LanguageModelWithMuxCostsIncluded)[MUX_MODEL_COSTS_INCLUDED] === true;
+}
+
+/**
+ * Extract text from AI SDK message content.
+ * Content may be a plain string or a structured array like [{type:"text", text:"..."}].
+ */
+function extractTextContent(content: unknown): string {
+  if (typeof content === "string") return content.trim();
+  if (Array.isArray(content)) {
+    return (content as unknown[])
+      .filter(
+        (part): part is { type: string; text: string } =>
+          typeof part === "object" &&
+          part !== null &&
+          (part as { type?: unknown }).type === "text" &&
+          typeof (part as { text?: unknown }).text === "string"
+      )
+      .map((part) => part.text)
+      .join("")
+      .trim();
+  }
+  return "";
+}
+
 export class AIService extends EventEmitter {
   private readonly streamManager: StreamManager;
   private readonly historyService: HistoryService;
@@ -556,6 +599,7 @@ export class AIService extends EventEmitter {
   private mcpServerManager?: MCPServerManager;
   private policyService?: PolicyService;
   private telemetryService?: TelemetryService;
+  private codexOauthService?: CodexOauthService;
   private readonly initStateManager: InitStateManager;
   private mockModeEnabled: boolean;
   private mockAiStreamPlayer?: MockAiStreamPlayer;
@@ -613,6 +657,9 @@ export class AIService extends EventEmitter {
   }
   setTelemetryService(service: TelemetryService): void {
     this.telemetryService = service;
+  }
+  setCodexOauthService(service: CodexOauthService): void {
+    this.codexOauthService = service;
   }
   setMCPServerManager(manager: MCPServerManager): void {
     this.mcpServerManager = manager;
@@ -871,16 +918,57 @@ export class AIService extends EventEmitter {
 
       // Handle OpenAI provider (using Responses API)
       if (providerName === "openai") {
+        const fullModelId = `${providerName}:${modelId}`;
+
+        const codexOauthAllowed = isCodexOauthAllowedModelId(fullModelId);
+        const codexOauthRequired = isCodexOauthRequiredModelId(fullModelId);
+
+        const storedCodexOauth = parseCodexOauthAuth(
+          (providerConfig as { codexOauth?: unknown }).codexOauth
+        );
+
+        if (codexOauthRequired && !storedCodexOauth) {
+          return Err({ type: "oauth_not_connected", provider: providerName });
+        }
+
         // Resolve credentials from config + env (single source of truth)
         const creds = resolveProviderCredentials("openai", providerConfig);
-        if (!creds.isConfigured) {
+
+        const codexOauthDefaultAuthRaw = (providerConfig as { codexOauthDefaultAuth?: unknown })
+          .codexOauthDefaultAuth;
+        const codexOauthDefaultAuth = codexOauthDefaultAuthRaw === "apiKey" ? "apiKey" : "oauth";
+
+        // Codex OAuth routing:
+        // - Required models always route through ChatGPT OAuth.
+        // - Allowed models route through OAuth only when:
+        //   - no API key is configured, OR
+        //   - the user prefers OAuth when both are set.
+        const shouldRouteThroughCodexOauth = (() => {
+          if (!codexOauthAllowed || !storedCodexOauth) {
+            return false;
+          }
+
+          if (codexOauthRequired) {
+            return true;
+          }
+
+          if (!creds.isConfigured) {
+            return true;
+          }
+
+          return codexOauthDefaultAuth === "oauth";
+        })();
+
+        if (!shouldRouteThroughCodexOauth && !creds.isConfigured) {
           return Err({ type: "api_key_not_found", provider: providerName });
         }
 
         // Merge resolved credentials into config
         const configWithCreds = {
           ...providerConfig,
-          apiKey: creds.apiKey,
+          // When using Codex OAuth, we overwrite auth headers in fetch(), so the OpenAI API key
+          // isn't required. Still pass a placeholder to ensure the SDK never reads env vars.
+          apiKey: shouldRouteThroughCodexOauth ? (creds.apiKey ?? "codex-oauth") : creds.apiKey,
           ...(creds.baseUrl && !providerConfig.baseURL && { baseURL: creds.baseUrl }),
           ...(creds.organization && { organization: creds.organization }),
         };
@@ -895,6 +983,7 @@ export class AIService extends EventEmitter {
         }
 
         const baseFetch = getProviderFetch(providerConfig);
+        const codexOauthService = this.codexOauthService;
 
         // Wrap fetch to default truncation to "disabled" for OpenAI Responses API calls.
         // This preserves our compaction handling while still allowing explicit truncation (e.g., auto).
@@ -922,33 +1011,153 @@ export class AIService extends EventEmitter {
 
               const method = (init?.method ?? "GET").toUpperCase();
               const isOpenAIResponses = /\/v1\/responses(\?|$)/.test(urlString);
+              const isOpenAIChatCompletions = /\/chat\/completions(\?|$)/.test(urlString);
+
+              let nextInput: Parameters<typeof fetch>[0] = input;
+              let nextInit: Parameters<typeof fetch>[1] | undefined = init;
 
               const body = init?.body;
-              if (isOpenAIResponses && method === "POST" && typeof body === "string") {
-                // Clone headers to avoid mutating caller-provided objects
-                const headers = new Headers(init?.headers);
-                // Remove content-length if present, since body will change
-                headers.delete("content-length");
-
+              // Only parse the JSON body when routing through Codex OAuth — it needs
+              // instruction lifting, store=false, and truncation enforcement.  For
+              // non-Codex requests the SDK already sends the correct truncation value
+              // via providerOptions, so we skip the expensive parse + re-stringify.
+              if (
+                shouldRouteThroughCodexOauth &&
+                isOpenAIResponses &&
+                method === "POST" &&
+                typeof body === "string"
+              ) {
                 try {
                   const json = JSON.parse(body) as Record<string, unknown>;
                   const truncation = json.truncation;
                   if (truncation !== "auto" && truncation !== "disabled") {
                     json.truncation = "disabled";
                   }
+
+                  // Codex OAuth (chatgpt.com/backend-api/codex/responses) rejects requests unless
+                  // `instructions` is present and non-empty, and `store` is set to false.
+                  // The AI SDK maps `system` prompts into the `input` array
+                  // (role: system|developer) but does *not* automatically populate
+                  // `instructions`, so we lift all system prompts into `instructions` when
+                  // routing through Codex OAuth.
+
+                  // Codex endpoint requires store=false and only accepts a subset of the
+                  // standard OpenAI Responses API parameters. Use an allowlist to strip
+                  // everything the endpoint doesn't understand (it rejects unknown params
+                  // with 400).
+                  json.store = false;
+
+                  const CODEX_ALLOWED_PARAMS = new Set([
+                    "model",
+                    "input",
+                    "instructions",
+                    "tools",
+                    "tool_choice",
+                    "parallel_tool_calls",
+                    "stream",
+                    "store",
+                    "reasoning",
+                    "temperature",
+                    "top_p",
+                    "include",
+                  ]);
+
+                  for (const key of Object.keys(json)) {
+                    if (!CODEX_ALLOWED_PARAMS.has(key)) {
+                      delete json[key];
+                    }
+                  }
+
+                  // Filter out item_reference entries from the input. The AI SDK sends
+                  // these as an optimization when store=true — bare { type: "item_reference",
+                  // id: "rs_..." } objects that the server expands by looking up stored
+                  // content. With store=false (required for Codex), these lookups fail.
+                  // The full inline content is always present alongside references, so
+                  // removing them doesn't lose conversation context.
+                  if (Array.isArray(json.input)) {
+                    json.input = (json.input as Array<Record<string, unknown>>).filter(
+                      (item) =>
+                        !(item && typeof item === "object" && item.type === "item_reference")
+                    );
+                  }
+
+                  const existingInstructions =
+                    typeof json.instructions === "string" ? json.instructions.trim() : "";
+
+                  if (existingInstructions.length === 0) {
+                    const derivedParts: string[] = [];
+                    const keptInput: unknown[] = [];
+
+                    const responseInput = json.input;
+                    if (Array.isArray(responseInput)) {
+                      for (const item of responseInput as unknown[]) {
+                        if (!item || typeof item !== "object") {
+                          keptInput.push(item);
+                          continue;
+                        }
+
+                        const role = (item as { role?: unknown }).role;
+                        if (role !== "system" && role !== "developer") {
+                          keptInput.push(item);
+                          continue;
+                        }
+
+                        // Extract text from string content or structured content arrays
+                        // (AI SDK may produce [{type:"text", text:"..."}])
+                        const content = (item as { content?: unknown }).content;
+                        const text = extractTextContent(content);
+                        if (text.length > 0) {
+                          derivedParts.push(text);
+                        }
+                        // Drop this system/developer item from input (don't push to keptInput)
+                      }
+
+                      json.input = keptInput;
+                    }
+
+                    const joined = derivedParts.join("\n\n").trim();
+                    json.instructions = joined.length > 0 ? joined : "You are a helpful assistant.";
+                  }
+
+                  // Clone headers to avoid mutating caller-provided objects
+                  const headers = new Headers(init?.headers);
+                  // Remove content-length if present, since body will change
+                  headers.delete("content-length");
+
                   const newBody = JSON.stringify(json);
-                  const newInit: RequestInit = { ...init, headers, body: newBody };
-                  return baseFetch(input, newInit);
+                  nextInit = { ...init, headers, body: newBody };
                 } catch {
-                  // If body isn't JSON, fall through to normal fetch
-                  return baseFetch(input, init);
+                  // If body isn't JSON, fall through to normal fetch (but still allow Codex routing).
                 }
               }
 
-              // Default passthrough
-              return baseFetch(input, init);
-            } catch {
-              // On any unexpected error, fall back to original fetch
+              if (shouldRouteThroughCodexOauth && (isOpenAIResponses || isOpenAIChatCompletions)) {
+                if (!codexOauthService) {
+                  throw new Error("Codex OAuth service not initialized");
+                }
+
+                const authResult = await codexOauthService.getValidAuth();
+                if (!authResult.success) {
+                  throw new Error(authResult.error);
+                }
+
+                const headers = new Headers(nextInit?.headers);
+                headers.set("Authorization", `Bearer ${authResult.data.access}`);
+                if (authResult.data.accountId) {
+                  headers.set("ChatGPT-Account-Id", authResult.data.accountId);
+                }
+
+                nextInput = CODEX_ENDPOINT;
+                nextInit = { ...(nextInit ?? {}), headers };
+              }
+
+              return baseFetch(nextInput, nextInit);
+            } catch (error) {
+              // For normal OpenAI (API key) requests, fall back to the original fetch on unexpected errors.
+              // For Codex OAuth routing, failures should surface (falling back would hit api.openai.com).
+              if (shouldRouteThroughCodexOauth) {
+                throw error;
+              }
               return baseFetch(input, init);
             }
           },
@@ -970,6 +1179,36 @@ export class AIService extends EventEmitter {
         // Use Responses API for persistence and built-in tools
         // OpenAI manages reasoning state via previousResponseId - no middleware needed
         const model = provider.responses(modelId);
+        if (shouldRouteThroughCodexOauth) {
+          markModelCostsIncluded(model);
+
+          // Wrap model to inject store=false into providerOptions so the SDK
+          // sends full inline content instead of item_reference lookups.
+          // The Codex endpoint requires store=false; without this, the SDK
+          // defaults to store=true and sends bare { type: "item_reference" }
+          // items that can't be resolved.
+          const injectStoreFlag = (
+            options: Parameters<typeof model.doStream>[0]
+          ): Parameters<typeof model.doStream>[0] => {
+            const openaiOpts =
+              (options.providerOptions?.openai as Record<string, unknown> | undefined) ?? {};
+            return {
+              ...options,
+              providerOptions: {
+                ...options.providerOptions,
+                openai: {
+                  ...openaiOpts,
+                  store: false,
+                },
+              },
+            };
+          };
+
+          const originalDoStream = model.doStream.bind(model);
+          const originalDoGenerate = model.doGenerate.bind(model);
+          model.doStream = (options) => originalDoStream(injectStoreFlag(options));
+          model.doGenerate = (options) => originalDoGenerate(injectStoreFlag(options));
+        }
         return Ok(model);
       }
 
@@ -3152,6 +3391,7 @@ export class AIService extends EventEmitter {
           agentId: effectiveAgentId,
           mode: effectiveMode,
           routedThroughGateway,
+          ...(modelCostsIncluded(modelResult.data) ? { costsIncluded: true } : {}),
         },
         providerOptions,
         maxOutputTokens,
