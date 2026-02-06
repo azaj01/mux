@@ -1,4 +1,3 @@
-import * as path from "node:path";
 import assert from "node:assert/strict";
 import * as fsPromises from "fs/promises";
 
@@ -22,8 +21,12 @@ import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/age
 import { applyForkRuntimeUpdates } from "@/node/services/utils/forkRuntimeUpdates";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
 import { createRuntime, runBackgroundInit } from "@/node/runtime/runtimeFactory";
-import type { InitLogger, WorkspaceCreationResult, Runtime } from "@/node/runtime/Runtime";
-import { execBuffered } from "@/node/utils/runtime/helpers";
+import type { InitLogger, WorkspaceCreationResult } from "@/node/runtime/Runtime";
+import {
+  coerceNonEmptyString,
+  tryReadGitHeadCommitSha,
+  findWorkspaceEntry,
+} from "@/node/services/taskUtils";
 import { validateWorkspaceName } from "@/common/utils/validation/workspaceValidation";
 import { Ok, Err, type Result } from "@/common/types/result";
 import type { TaskSettings } from "@/common/types/tasks";
@@ -35,7 +38,7 @@ import { defaultModel, normalizeGatewayModel } from "@/common/utils/ai/models";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { AgentIdSchema } from "@/common/orpc/schemas";
-import { isExecLikeEditingCapableInResolvedChain } from "@/common/utils/agentTools";
+import { GitPatchArtifactService } from "@/node/services/gitPatchArtifactService";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { ToolCallEndEvent, StreamEndEvent } from "@/common/types/stream";
 import { isDynamicToolPart, type DynamicToolPart } from "@/common/types/toolParts";
@@ -47,13 +50,7 @@ import {
 import { formatSendMessageError } from "@/node/services/utils/sendMessageError";
 import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import { taskQueueDebug } from "@/node/services/taskQueueDebug";
-import { shellQuote } from "@/common/utils/shell";
-import { streamToString } from "@/node/runtime/streamUtils";
-import {
-  getSubagentGitPatchMboxPath,
-  readSubagentGitPatchArtifact,
-  upsertSubagentGitPatchArtifact,
-} from "@/node/services/subagentGitPatchArtifacts";
+import { readSubagentGitPatchArtifact } from "@/node/services/subagentGitPatchArtifacts";
 import {
   readSubagentReportArtifact,
   readSubagentReportArtifactsFile,
@@ -162,61 +159,6 @@ function isStreamEndEvent(value: unknown): value is StreamEndEvent {
   );
 }
 
-async function tryReadGitHeadCommitSha(
-  runtime: Runtime,
-  workspacePath: string
-): Promise<string | null> {
-  assert(workspacePath.length > 0, "tryReadGitHeadCommitSha: workspacePath must be non-empty");
-
-  try {
-    const result = await execBuffered(runtime, "git rev-parse HEAD", {
-      cwd: workspacePath,
-      timeout: 10,
-    });
-    if (result.exitCode !== 0) {
-      return null;
-    }
-
-    const sha = result.stdout.trim();
-    return sha.length > 0 ? sha : null;
-  } catch {
-    return null;
-  }
-}
-
-async function writeReadableStreamToLocalFile(
-  stream: ReadableStream<Uint8Array>,
-  filePath: string
-): Promise<void> {
-  assert(filePath.length > 0, "writeReadableStreamToLocalFile: filePath must be non-empty");
-
-  await fsPromises.mkdir(path.dirname(filePath), { recursive: true });
-
-  const fileHandle = await fsPromises.open(filePath, "w");
-  try {
-    const reader = stream.getReader();
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value) {
-          await fileHandle.write(value);
-        }
-      }
-    } finally {
-      reader.releaseLock();
-    }
-  } finally {
-    await fileHandle.close();
-  }
-}
-
-function coerceNonEmptyString(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : null;
-}
-
 function hasAncestorWorkspaceId(
   entry: { ancestorWorkspaceIds?: unknown } | null | undefined,
   ancestorWorkspaceId: string
@@ -277,7 +219,7 @@ export class TaskService {
   // Cache completed reports so callers can retrieve them without re-reading disk.
   // Bounded by max entries; disk persistence is the source of truth for restart-safety.
   private readonly completedReportsByTaskId = new Map<string, CompletedAgentReportCacheEntry>();
-  private readonly pendingSubagentGitPatchJobsByTaskId = new Map<string, Promise<void>>();
+  private readonly gitPatchArtifactService: GitPatchArtifactService;
   private readonly remindedAwaitingReport = new Set<string>();
 
   constructor(
@@ -288,6 +230,8 @@ export class TaskService {
     private readonly workspaceService: WorkspaceService,
     private readonly initStateManager: InitStateManager
   ) {
+    this.gitPatchArtifactService = new GitPatchArtifactService(config);
+
     this.aiService.on("tool-call-end", (payload: unknown) => {
       if (!isToolCallEndEvent(payload)) return;
       if (payload.toolName !== "agent_report") return;
@@ -447,7 +391,11 @@ export class TaskService {
     for (const task of reportedTasks) {
       if (!task.parentWorkspaceId) continue;
       try {
-        await this.maybeStartSubagentGitPatchArtifactGeneration(task.parentWorkspaceId, task.id!);
+        await this.gitPatchArtifactService.maybeStartGeneration(
+          task.parentWorkspaceId,
+          task.id!,
+          (wsId) => this.cleanupReportedLeafTask(wsId)
+        );
       } catch (error: unknown) {
         log.error("Failed to resume subagent git patch generation on startup", {
           parentWorkspaceId: task.parentWorkspaceId,
@@ -519,7 +467,7 @@ export class TaskService {
     const cfg = this.config.loadConfigOrDefault();
     const taskSettings = cfg.taskSettings ?? DEFAULT_TASK_SETTINGS;
 
-    const parentEntry = this.findWorkspaceEntry(cfg, parentWorkspaceId);
+    const parentEntry = findWorkspaceEntry(cfg, parentWorkspaceId);
     if (parentEntry?.workspace.taskStatus === "reported") {
       return Err("Task.create: cannot spawn new tasks after agent_report");
     }
@@ -926,7 +874,7 @@ export class TaskService {
       await using _lock = await this.mutex.acquire();
 
       const cfg = this.config.loadConfigOrDefault();
-      const entry = this.findWorkspaceEntry(cfg, taskId);
+      const entry = findWorkspaceEntry(cfg, taskId);
       if (!entry?.workspace.parentWorkspaceId) {
         return Err("Task not found");
       }
@@ -1099,7 +1047,7 @@ export class TaskService {
     // Fast-path: if the task is already gone (cleanup) or already reported (restart), return the
     // persisted artifact from the requesting workspace session dir.
     const cfg = this.config.loadConfigOrDefault();
-    const taskWorkspaceEntry = this.findWorkspaceEntry(cfg, taskId);
+    const taskWorkspaceEntry = findWorkspaceEntry(cfg, taskId);
     if (!taskWorkspaceEntry || taskWorkspaceEntry.workspace.taskStatus === "reported") {
       const persisted = await tryReadPersistedReport();
       if (persisted) {
@@ -1113,7 +1061,7 @@ export class TaskService {
       void (async () => {
         // Validate existence early to avoid waiting on never-resolving task IDs.
         const cfg = this.config.loadConfigOrDefault();
-        const taskWorkspaceEntry = this.findWorkspaceEntry(cfg, taskId);
+        const taskWorkspaceEntry = findWorkspaceEntry(cfg, taskId);
         if (!taskWorkspaceEntry) {
           const persisted = await tryReadPersistedReport();
           if (persisted) {
@@ -1231,7 +1179,7 @@ export class TaskService {
 
           // Close the race where the task starts between the initial config read and registering the waiter.
           const cfgAfterRegister = this.config.loadConfigOrDefault();
-          const afterEntry = this.findWorkspaceEntry(cfgAfterRegister, taskId);
+          const afterEntry = findWorkspaceEntry(cfgAfterRegister, taskId);
           if (afterEntry?.workspace.taskStatus !== "queued") {
             cleanupStartWaiter();
             startReportTimeout();
@@ -1270,7 +1218,7 @@ export class TaskService {
     assert(taskId.length > 0, "getAgentTaskStatus: taskId must be non-empty");
 
     const cfg = this.config.loadConfigOrDefault();
-    const entry = this.findWorkspaceEntry(cfg, taskId);
+    const entry = findWorkspaceEntry(cfg, taskId);
     const status = entry?.workspace.taskStatus;
     return status ?? null;
   }
@@ -1675,7 +1623,7 @@ export class TaskService {
         break;
       }
 
-      const taskEntry = this.findWorkspaceEntry(config, taskId);
+      const taskEntry = findWorkspaceEntry(config, taskId);
       if (!taskEntry?.workspace.parentWorkspaceId) continue;
       const task = taskEntry.workspace;
       if (task.taskStatus !== "queued") continue;
@@ -1697,7 +1645,7 @@ export class TaskService {
         continue;
       }
 
-      const parentEntry = this.findWorkspaceEntry(config, parentId);
+      const parentEntry = findWorkspaceEntry(config, parentId);
       if (!parentEntry) {
         log.error("Queued task parent not found; cannot start", { taskId, parentId });
         continue;
@@ -2038,7 +1986,7 @@ export class TaskService {
     const workspaceId = event.workspaceId;
 
     const cfg = this.config.loadConfigOrDefault();
-    const entry = this.findWorkspaceEntry(cfg, workspaceId);
+    const entry = findWorkspaceEntry(cfg, workspaceId);
     if (!entry) return;
 
     // Parent workspaces must not end while they have active background tasks.
@@ -2195,7 +2143,7 @@ export class TaskService {
     }
 
     const cfgBeforeReport = this.config.loadConfigOrDefault();
-    const childEntryBeforeReport = this.findWorkspaceEntry(cfgBeforeReport, childWorkspaceId);
+    const childEntryBeforeReport = findWorkspaceEntry(cfgBeforeReport, childWorkspaceId);
     if (childEntryBeforeReport?.workspace.taskStatus === "reported") {
       return;
     }
@@ -2235,7 +2183,7 @@ export class TaskService {
     );
 
     const cfgBeforeReport = this.config.loadConfigOrDefault();
-    const statusBefore = this.findWorkspaceEntry(cfgBeforeReport, childWorkspaceId)?.workspace
+    const statusBefore = findWorkspaceEntry(cfgBeforeReport, childWorkspaceId)?.workspace
       .taskStatus;
     if (statusBefore === "reported") {
       return;
@@ -2298,8 +2246,7 @@ export class TaskService {
     }
 
     const cfgAfterReport = this.config.loadConfigOrDefault();
-    const latestChildEntry =
-      this.findWorkspaceEntry(cfgAfterReport, childWorkspaceId) ?? childEntry;
+    const latestChildEntry = findWorkspaceEntry(cfgAfterReport, childWorkspaceId) ?? childEntry;
     const parentWorkspaceId = latestChildEntry?.workspace.parentWorkspaceId;
     if (!parentWorkspaceId) {
       const reason = latestChildEntry
@@ -2363,7 +2310,11 @@ export class TaskService {
     // It must also run before resolving waiters so an immediate `task_await` result after
     // `agent_report` can include at least a pending artifact record.
     try {
-      await this.maybeStartSubagentGitPatchArtifactGeneration(parentWorkspaceId, childWorkspaceId);
+      await this.gitPatchArtifactService.maybeStartGeneration(
+        parentWorkspaceId,
+        childWorkspaceId,
+        (wsId) => this.cleanupReportedLeafTask(wsId)
+      );
     } catch (error: unknown) {
       log.error("Failed to start subagent git patch generation", {
         parentWorkspaceId,
@@ -2383,7 +2334,7 @@ export class TaskService {
 
     // Auto-resume any parent stream that was waiting on a task tool call (restart-safe).
     const postCfg = this.config.loadConfigOrDefault();
-    if (!this.findWorkspaceEntry(postCfg, parentWorkspaceId)) {
+    if (!findWorkspaceEntry(postCfg, parentWorkspaceId)) {
       // Parent may have been cleaned up (e.g. it already reported and this was its last descendant).
       return;
     }
@@ -2399,466 +2350,6 @@ export class TaskService {
           error: resumeResult.error,
         });
       }
-    }
-  }
-
-  private async maybeStartSubagentGitPatchArtifactGeneration(
-    parentWorkspaceId: string,
-    childWorkspaceId: string
-  ): Promise<void> {
-    assert(
-      parentWorkspaceId.length > 0,
-      "maybeStartSubagentGitPatchArtifactGeneration: parentWorkspaceId must be non-empty"
-    );
-    assert(
-      childWorkspaceId.length > 0,
-      "maybeStartSubagentGitPatchArtifactGeneration: childWorkspaceId must be non-empty"
-    );
-
-    const parentSessionDir = this.config.getSessionDir(parentWorkspaceId);
-
-    // Write a pending marker before we attempt cleanup, so the reported task workspace isn't deleted
-    // while we're still reading commits from it.
-    const nowMs = Date.now();
-    const cfg = this.config.loadConfigOrDefault();
-    const childEntry = this.findWorkspaceEntry(cfg, childWorkspaceId);
-
-    // Only exec-like subagents are expected to make commits that should be handed back to the parent.
-    // NOTE: Custom agents can inherit from exec (base: exec). Those should also generate patches,
-    // but read-only subagents (e.g. explore) should not.
-    const childAgentIdRaw = coerceNonEmptyString(
-      childEntry?.workspace.agentId ?? childEntry?.workspace.agentType
-    );
-    const childAgentId = childAgentIdRaw?.toLowerCase();
-    if (!childAgentId) {
-      return;
-    }
-
-    let shouldGeneratePatch = childAgentId === "exec";
-
-    if (!shouldGeneratePatch) {
-      const parsedChildAgentId = AgentIdSchema.safeParse(childAgentId);
-      if (parsedChildAgentId.success) {
-        const agentId = parsedChildAgentId.data;
-
-        // Prefer resolving agent inheritance from the parent workspace: project agents may be untracked
-        // (and therefore absent from child worktrees), but they are always present in the parent that
-        // spawned the task.
-        const agentDiscoveryEntry = this.findWorkspaceEntry(cfg, parentWorkspaceId) ?? childEntry;
-        const agentDiscoveryWs = agentDiscoveryEntry?.workspace;
-
-        const agentWorkspacePath = coerceNonEmptyString(agentDiscoveryWs?.path);
-        const runtimeConfig = agentDiscoveryWs?.runtimeConfig;
-
-        if (agentDiscoveryEntry && agentWorkspacePath && runtimeConfig) {
-          const fallbackName =
-            agentWorkspacePath.split("/").pop() ?? agentWorkspacePath.split("\\").pop() ?? "";
-          const workspaceName =
-            coerceNonEmptyString(agentDiscoveryWs?.name) ?? coerceNonEmptyString(fallbackName);
-
-          if (workspaceName) {
-            const runtime = createRuntimeForWorkspace({
-              runtimeConfig,
-              projectPath: agentDiscoveryEntry.projectPath,
-              name: workspaceName,
-            });
-
-            try {
-              const agentDefinition = await readAgentDefinition(
-                runtime,
-                agentWorkspacePath,
-                agentId
-              );
-              const chain = await resolveAgentInheritanceChain({
-                runtime,
-                workspacePath: agentWorkspacePath,
-                agentId,
-                agentDefinition,
-                workspaceId: childWorkspaceId,
-              });
-
-              shouldGeneratePatch = isExecLikeEditingCapableInResolvedChain(chain);
-            } catch {
-              // ignore - treat as non-exec-like
-            }
-          }
-        }
-      }
-    }
-
-    if (!shouldGeneratePatch) {
-      return;
-    }
-
-    const baseCommitSha =
-      coerceNonEmptyString(childEntry?.workspace.taskBaseCommitSha) ?? undefined;
-
-    const artifact = await upsertSubagentGitPatchArtifact({
-      workspaceId: parentWorkspaceId,
-      workspaceSessionDir: parentSessionDir,
-      childTaskId: childWorkspaceId,
-      updater: (existing) => {
-        if (existing && existing.status !== "pending") {
-          return existing;
-        }
-
-        return {
-          ...(existing ?? {}),
-          childTaskId: childWorkspaceId,
-          parentWorkspaceId,
-          createdAtMs: existing?.createdAtMs ?? nowMs,
-          updatedAtMs: nowMs,
-          status: "pending",
-          baseCommitSha: baseCommitSha ?? existing?.baseCommitSha,
-        };
-      },
-    });
-
-    if (artifact.status !== "pending") {
-      return;
-    }
-
-    if (this.pendingSubagentGitPatchJobsByTaskId.has(childWorkspaceId)) {
-      return;
-    }
-
-    let job: Promise<void>;
-    try {
-      job = this.generateSubagentGitPatchArtifact(parentWorkspaceId, childWorkspaceId)
-        .catch(async (error: unknown) => {
-          log.error("Subagent git patch generation failed", {
-            parentWorkspaceId,
-            childWorkspaceId,
-            error,
-          });
-
-          // Best-effort: if generation failed before it could update the artifact status,
-          // mark it failed so the parent isn't blocked forever by a pending marker.
-          try {
-            await upsertSubagentGitPatchArtifact({
-              workspaceId: parentWorkspaceId,
-              workspaceSessionDir: parentSessionDir,
-              childTaskId: childWorkspaceId,
-              updater: (existing) => {
-                if (existing && existing.status !== "pending") {
-                  return existing;
-                }
-
-                const failedAtMs = Date.now();
-                return {
-                  ...(existing ?? {}),
-                  childTaskId: childWorkspaceId,
-                  parentWorkspaceId,
-                  createdAtMs: existing?.createdAtMs ?? failedAtMs,
-                  updatedAtMs: failedAtMs,
-                  status: "failed",
-                  error: error instanceof Error ? error.message : String(error),
-                };
-              },
-            });
-          } catch (updateError: unknown) {
-            log.error("Failed to mark subagent git patch artifact as failed", {
-              parentWorkspaceId,
-              childWorkspaceId,
-              error: updateError,
-            });
-          }
-        })
-        .finally(() => {
-          this.pendingSubagentGitPatchJobsByTaskId.delete(childWorkspaceId);
-        });
-    } catch (error: unknown) {
-      // If scheduling fails synchronously, don't leave the artifact stuck in `pending`.
-      await upsertSubagentGitPatchArtifact({
-        workspaceId: parentWorkspaceId,
-        workspaceSessionDir: parentSessionDir,
-        childTaskId: childWorkspaceId,
-        updater: (existing) => {
-          if (existing && existing.status !== "pending") {
-            return existing;
-          }
-
-          const failedAtMs = Date.now();
-          return {
-            ...(existing ?? {}),
-            childTaskId: childWorkspaceId,
-            parentWorkspaceId,
-            createdAtMs: existing?.createdAtMs ?? failedAtMs,
-            updatedAtMs: failedAtMs,
-            status: "failed",
-            error: error instanceof Error ? error.message : String(error),
-          };
-        },
-      });
-      return;
-    }
-
-    this.pendingSubagentGitPatchJobsByTaskId.set(childWorkspaceId, job);
-  }
-
-  private async generateSubagentGitPatchArtifact(
-    parentWorkspaceId: string,
-    childWorkspaceId: string
-  ): Promise<void> {
-    assert(
-      parentWorkspaceId.length > 0,
-      "generateSubagentGitPatchArtifact: parentWorkspaceId must be non-empty"
-    );
-    assert(
-      childWorkspaceId.length > 0,
-      "generateSubagentGitPatchArtifact: childWorkspaceId must be non-empty"
-    );
-
-    const parentSessionDir = this.config.getSessionDir(parentWorkspaceId);
-
-    const updateArtifact = async (
-      updater: Parameters<typeof upsertSubagentGitPatchArtifact>[0]["updater"]
-    ): Promise<void> => {
-      await upsertSubagentGitPatchArtifact({
-        workspaceId: parentWorkspaceId,
-        workspaceSessionDir: parentSessionDir,
-        childTaskId: childWorkspaceId,
-        updater,
-      });
-    };
-
-    const nowMs = Date.now();
-
-    try {
-      const cfg = this.config.loadConfigOrDefault();
-      const entry = this.findWorkspaceEntry(cfg, childWorkspaceId);
-      if (!entry) {
-        await updateArtifact((existing) => ({
-          ...(existing ?? {}),
-          childTaskId: childWorkspaceId,
-          parentWorkspaceId,
-          createdAtMs: existing?.createdAtMs ?? nowMs,
-          updatedAtMs: nowMs,
-          status: "failed",
-          error: "Task workspace not found in config.",
-        }));
-        return;
-      }
-
-      const ws = entry.workspace;
-
-      const workspacePath = coerceNonEmptyString(ws.path);
-      if (!workspacePath) {
-        await updateArtifact((existing) => ({
-          ...(existing ?? {}),
-          childTaskId: childWorkspaceId,
-          parentWorkspaceId,
-          createdAtMs: existing?.createdAtMs ?? nowMs,
-          updatedAtMs: nowMs,
-          status: "failed",
-          error: "Task workspace path missing.",
-        }));
-        return;
-      }
-
-      if (!ws.runtimeConfig) {
-        await updateArtifact((existing) => ({
-          ...(existing ?? {}),
-          childTaskId: childWorkspaceId,
-          parentWorkspaceId,
-          createdAtMs: existing?.createdAtMs ?? nowMs,
-          updatedAtMs: nowMs,
-          status: "failed",
-          error: "Task runtimeConfig missing.",
-        }));
-        return;
-      }
-
-      const fallbackName = workspacePath.split("/").pop() ?? workspacePath.split("\\").pop() ?? "";
-      const workspaceName = coerceNonEmptyString(ws.name) ?? coerceNonEmptyString(fallbackName);
-      if (!workspaceName) {
-        await updateArtifact((existing) => ({
-          ...(existing ?? {}),
-          childTaskId: childWorkspaceId,
-          parentWorkspaceId,
-          createdAtMs: existing?.createdAtMs ?? nowMs,
-          updatedAtMs: nowMs,
-          status: "failed",
-          error: "Task workspace name missing.",
-        }));
-        return;
-      }
-
-      const runtime = createRuntimeForWorkspace({
-        runtimeConfig: ws.runtimeConfig,
-        projectPath: entry.projectPath,
-        name: workspaceName,
-      });
-
-      let baseCommitSha = coerceNonEmptyString(ws.taskBaseCommitSha);
-      if (!baseCommitSha) {
-        const trunkBranch =
-          coerceNonEmptyString(ws.taskTrunkBranch) ??
-          coerceNonEmptyString(this.findWorkspaceEntry(cfg, parentWorkspaceId)?.workspace.name);
-
-        if (!trunkBranch) {
-          await updateArtifact((existing) => ({
-            ...(existing ?? {}),
-            childTaskId: childWorkspaceId,
-            parentWorkspaceId,
-            createdAtMs: existing?.createdAtMs ?? nowMs,
-            updatedAtMs: nowMs,
-            status: "failed",
-            error:
-              "taskBaseCommitSha missing and could not determine trunk branch for merge-base fallback.",
-          }));
-          return;
-        }
-
-        const mergeBaseResult = await execBuffered(
-          runtime,
-          `git merge-base ${shellQuote(trunkBranch)} HEAD`,
-          { cwd: workspacePath, timeout: 30 }
-        );
-        if (mergeBaseResult.exitCode !== 0) {
-          await updateArtifact((existing) => ({
-            ...(existing ?? {}),
-            childTaskId: childWorkspaceId,
-            parentWorkspaceId,
-            createdAtMs: existing?.createdAtMs ?? nowMs,
-            updatedAtMs: nowMs,
-            status: "failed",
-            error: `git merge-base failed: ${mergeBaseResult.stderr.trim() || "unknown error"}`,
-          }));
-          return;
-        }
-
-        baseCommitSha = mergeBaseResult.stdout.trim();
-      }
-
-      const headCommitSha = await tryReadGitHeadCommitSha(runtime, workspacePath);
-      if (!headCommitSha) {
-        await updateArtifact((existing) => ({
-          ...(existing ?? {}),
-          childTaskId: childWorkspaceId,
-          parentWorkspaceId,
-          createdAtMs: existing?.createdAtMs ?? nowMs,
-          updatedAtMs: nowMs,
-          status: "failed",
-          error: "git rev-parse HEAD failed.",
-        }));
-        return;
-      }
-
-      const countResult = await execBuffered(
-        runtime,
-        `git rev-list --count ${baseCommitSha}..${headCommitSha}`,
-        { cwd: workspacePath, timeout: 30 }
-      );
-      if (countResult.exitCode !== 0) {
-        await updateArtifact((existing) => ({
-          ...(existing ?? {}),
-          childTaskId: childWorkspaceId,
-          parentWorkspaceId,
-          createdAtMs: existing?.createdAtMs ?? nowMs,
-          updatedAtMs: nowMs,
-          status: "failed",
-          baseCommitSha,
-          headCommitSha,
-          error: `git rev-list failed: ${countResult.stderr.trim() || "unknown error"}`,
-        }));
-        return;
-      }
-
-      const commitCount = Number.parseInt(countResult.stdout.trim(), 10);
-      if (!Number.isFinite(commitCount) || commitCount < 0) {
-        await updateArtifact((existing) => ({
-          ...(existing ?? {}),
-          childTaskId: childWorkspaceId,
-          parentWorkspaceId,
-          createdAtMs: existing?.createdAtMs ?? nowMs,
-          updatedAtMs: nowMs,
-          status: "failed",
-          baseCommitSha,
-          headCommitSha,
-          error: `Invalid commit count: ${countResult.stdout.trim()}`,
-        }));
-        return;
-      }
-
-      if (commitCount === 0) {
-        await updateArtifact((existing) => ({
-          ...(existing ?? {}),
-          childTaskId: childWorkspaceId,
-          parentWorkspaceId,
-          createdAtMs: existing?.createdAtMs ?? nowMs,
-          updatedAtMs: nowMs,
-          status: "skipped",
-          baseCommitSha,
-          headCommitSha,
-          commitCount,
-          error: undefined,
-        }));
-        return;
-      }
-
-      const patchPath = getSubagentGitPatchMboxPath(parentSessionDir, childWorkspaceId);
-
-      const formatPatchStream = await runtime.exec(
-        `git format-patch --stdout --binary ${baseCommitSha}..${headCommitSha}`,
-        { cwd: workspacePath, timeout: 120 }
-      );
-      await formatPatchStream.stdin.close();
-
-      const stderrPromise = streamToString(formatPatchStream.stderr);
-      const writePromise = writeReadableStreamToLocalFile(formatPatchStream.stdout, patchPath);
-
-      const [exitCode, stderr] = await Promise.all([
-        formatPatchStream.exitCode,
-        stderrPromise,
-        writePromise,
-      ]);
-
-      if (exitCode !== 0) {
-        // Leave no half-written patches around.
-        await fsPromises.rm(patchPath, { force: true });
-
-        await updateArtifact((existing) => ({
-          ...(existing ?? {}),
-          childTaskId: childWorkspaceId,
-          parentWorkspaceId,
-          createdAtMs: existing?.createdAtMs ?? nowMs,
-          updatedAtMs: Date.now(),
-          status: "failed",
-          baseCommitSha,
-          headCommitSha,
-          commitCount,
-          error: `git format-patch failed (exitCode=${exitCode}): ${stderr.trim() || "unknown error"}`,
-        }));
-        return;
-      }
-
-      await updateArtifact((existing) => ({
-        ...(existing ?? {}),
-        childTaskId: childWorkspaceId,
-        parentWorkspaceId,
-        createdAtMs: existing?.createdAtMs ?? nowMs,
-        updatedAtMs: Date.now(),
-        status: "ready",
-        baseCommitSha,
-        headCommitSha,
-        commitCount,
-        mboxPath: patchPath,
-        error: undefined,
-      }));
-    } catch (error: unknown) {
-      await updateArtifact((existing) => ({
-        ...(existing ?? {}),
-        childTaskId: childWorkspaceId,
-        parentWorkspaceId,
-        createdAtMs: existing?.createdAtMs ?? nowMs,
-        updatedAtMs: Date.now(),
-        status: "failed",
-        error: error instanceof Error ? error.message : String(error),
-      }));
-    } finally {
-      // Unblock auto-cleanup once the patch generation attempt has finished.
-      await this.cleanupReportedLeafTask(childWorkspaceId);
     }
   }
 
@@ -3142,7 +2633,7 @@ export class TaskService {
       visited.add(currentWorkspaceId);
 
       const config = this.config.loadConfigOrDefault();
-      const entry = this.findWorkspaceEntry(config, currentWorkspaceId);
+      const entry = findWorkspaceEntry(config, currentWorkspaceId);
       if (!entry) return;
 
       const ws = entry.workspace;
@@ -3183,19 +2674,5 @@ export class TaskService {
     log.error("cleanupReportedLeafTask: exceeded max parent traversal depth", {
       workspaceId,
     });
-  }
-
-  private findWorkspaceEntry(
-    config: ReturnType<Config["loadConfigOrDefault"]>,
-    workspaceId: string
-  ): { projectPath: string; workspace: WorkspaceConfigEntry } | null {
-    for (const [projectPath, project] of config.projects) {
-      for (const workspace of project.workspaces) {
-        if (workspace.id === workspaceId) {
-          return { projectPath, workspace };
-        }
-      }
-    }
-    return null;
   }
 }
