@@ -1075,7 +1075,19 @@ const keepAliveInterval = setInterval(() => {
 main()
   .then((exitCode) => {
     clearInterval(keepAliveInterval);
-    process.exit(exitCode);
+    // Flush stdout before exiting — process.exit() kills immediately and may
+    // drop buffered writes (e.g. the run-complete JSON line piped to tee in benchmarks).
+    if (process.stdout.writableNeedDrain) {
+      const exit = () => process.exit(exitCode);
+      process.stdout.once("drain", exit);
+      // Safety: if the downstream consumer closes (broken pipe) or backpressure
+      // never resolves, exit anyway after 1s to avoid hanging.
+      process.stdout.once("error", exit);
+      process.stdout.once("close", exit);
+      setTimeout(exit, 1000).unref();
+    } else {
+      process.exit(exitCode);
+    }
   })
   .catch((error) => {
     clearInterval(keepAliveInterval);
