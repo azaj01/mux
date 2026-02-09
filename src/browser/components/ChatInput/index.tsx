@@ -95,6 +95,7 @@ import type { PendingUserMessage } from "@/browser/utils/chatEditing";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
+import { resolveThinkingInput } from "@/common/utils/thinking/policy";
 import {
   type MuxFrontendMetadata,
   type ReviewNoteDataForDisplay,
@@ -1997,11 +1998,18 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           inputRef.current.style.height = "";
         }
 
-        // One-shot models shouldn't update the persisted session defaults.
+        // One-shot models/thinking shouldn't update the persisted session defaults.
+        // Resolve thinking level: numeric indices are model-relative (0 = model's lowest allowed level)
+        const rawThinkingOverride = modelOneShot?.thinkingLevel;
+        const thinkingOverride =
+          rawThinkingOverride != null
+            ? resolveThinkingInput(rawThinkingOverride, policyModel)
+            : undefined;
         const sendOptions = {
           ...sendMessageOptions,
           ...compactionOptions,
           ...(modelOverride ? { model: modelOverride } : {}),
+          ...(thinkingOverride ? { thinkingLevel: thinkingOverride } : {}),
           ...(modelOneShot ? { skipAiSettingsPersistence: true } : {}),
           additionalSystemInstructions,
           editMessageId: editingMessage?.id,
