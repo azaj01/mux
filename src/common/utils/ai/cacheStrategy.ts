@@ -1,4 +1,6 @@
 import { tool as createTool, type ModelMessage, type Tool } from "ai";
+import assert from "@/common/utils/assert";
+import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import { normalizeGatewayModel } from "./models";
 
 /**
@@ -28,6 +30,12 @@ const ANTHROPIC_CACHE_CONTROL = {
     cacheControl: { type: "ephemeral" as const },
   },
 };
+
+type ProviderNativeTool = Extract<Tool, { type: "provider" }>;
+
+function isProviderNativeTool(tool: Tool): tool is ProviderNativeTool {
+  return tool.type === "provider";
+}
 
 /**
  * Add providerOptions to the last content part of a message.
@@ -130,8 +138,10 @@ export function createCachedSystemMessage(
  * 3. Last tool only (1 breakpoint) - caches all tools up to and including this one
  * = 3 total, leaving 1 for future use
  *
- * NOTE: The SDK requires providerOptions to be passed during tool() creation,
- * not added afterwards. We re-create the last tool with providerOptions included.
+ * NOTE: Function tools with execute handlers are recreated so providerOptions is set
+ * at creation time. Provider-native tools (type: "provider") and execute-less
+ * dynamic/MCP tools keep their runtime metadata and are descriptor-cloned before
+ * attaching providerOptions.
  */
 export function applyCacheControlToTools<T extends Record<string, Tool>>(
   tools: T,
@@ -152,33 +162,32 @@ export function applyCacheControlToTools<T extends Record<string, Tool>>(
   const cachedTools = {} as unknown as T;
   for (const [key, existingTool] of Object.entries(tools)) {
     if (key === lastToolKey) {
-      // For provider-defined tools (like Anthropic's webSearch), we cannot recreate them
-      // with createTool() - they have special properties. Instead, spread providerOptions
-      // directly onto the tool object. While this doesn't work for regular tools (SDK
-      // requires providerOptions at creation time), provider-defined tools handle it.
-      const isProviderDefinedTool = (existingTool as { type?: string }).type === "provider-defined";
-
-      if (isProviderDefinedTool) {
-        // Provider-defined tools: add providerOptions directly (SDK handles it differently)
-        cachedTools[key as keyof T] = {
-          ...existingTool,
-          providerOptions: {
-            anthropic: {
-              cacheControl: { type: "ephemeral" },
-            },
-          },
-        } as unknown as T[keyof T];
+      if (isProviderNativeTool(existingTool)) {
+        // Provider-native tools (e.g. Anthropic/OpenAI web search) cannot be recreated with
+        // createTool(). Clone while preserving descriptors/getters and attach providerOptions.
+        const cachedProviderTool = cloneToolPreservingDescriptors(
+          existingTool
+        ) as ProviderNativeTool;
+        cachedProviderTool.providerOptions = ANTHROPIC_CACHE_CONTROL;
+        cachedTools[key as keyof T] = cachedProviderTool as unknown as T[keyof T];
+      } else if (existingTool.execute == null) {
+        // Some MCP/dynamic tools are valid without execute handlers (provider-/client-executed).
+        // Keep their runtime shape and attach cache control without forcing recreation.
+        const cachedDynamicTool = cloneToolPreservingDescriptors(existingTool);
+        cachedDynamicTool.providerOptions = ANTHROPIC_CACHE_CONTROL;
+        cachedTools[key as keyof T] = cachedDynamicTool as unknown as T[keyof T];
       } else {
-        // Regular tools: re-create with providerOptions (SDK requires this at creation time)
+        assert(
+          existingTool.execute != null,
+          `Tool "${key}" must define execute before cache control is applied`
+        );
+
+        // Function tools with execute handlers: re-create with providerOptions (SDK requires this at creation time)
         const cachedTool = createTool({
           description: existingTool.description,
           inputSchema: existingTool.inputSchema,
           execute: existingTool.execute,
-          providerOptions: {
-            anthropic: {
-              cacheControl: { type: "ephemeral" },
-            },
-          },
+          providerOptions: ANTHROPIC_CACHE_CONTROL,
         });
         cachedTools[key as keyof T] = cachedTool as unknown as T[keyof T];
       }
