@@ -2,7 +2,7 @@ import { describe, test, expect, beforeEach, mock } from "bun:test";
 import * as fs from "node:fs/promises";
 
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
-import { StreamManager } from "./streamManager";
+import { StreamManager, stripEncryptedContent } from "./streamManager";
 import { APICallError, RetryError, type ModelMessage } from "ai";
 import type { HistoryService } from "./historyService";
 import type { PartialService } from "./partialService";
@@ -81,6 +81,136 @@ describe("StreamManager - createTempDirForStream", () => {
         process.env.USERPROFILE = prevUserProfile;
       }
     }
+  });
+});
+
+describe("StreamManager - stopWhen configuration", () => {
+  type StopWhenCondition = (options: { steps: unknown[] }) => boolean;
+  type BuildStopWhenCondition = (request: {
+    toolChoice?: { type: "tool"; toolName: string } | "required";
+    hasQueuedMessage?: () => boolean;
+  }) => StopWhenCondition | StopWhenCondition[];
+
+  test("uses single-step stopWhen when a tool is required", () => {
+    const streamManager = new StreamManager(createMockHistoryService(), createMockPartialService());
+    const buildStopWhen = Reflect.get(streamManager, "createStopWhenCondition") as
+      | BuildStopWhenCondition
+      | undefined;
+    expect(typeof buildStopWhen).toBe("function");
+
+    const stopWhen = buildStopWhen!({ toolChoice: { type: "tool", toolName: "bash" } });
+    if (typeof stopWhen !== "function") {
+      throw new Error("Expected required-tool stopWhen to be a single condition function");
+    }
+
+    expect(stopWhen({ steps: [] })).toBe(false);
+    expect(stopWhen({ steps: [{}] })).toBe(true);
+    expect(stopWhen({ steps: [{}, {}] })).toBe(false);
+  });
+
+  test("uses autonomous step cap and queued-message interrupt conditions", () => {
+    const streamManager = new StreamManager(createMockHistoryService(), createMockPartialService());
+    const buildStopWhen = Reflect.get(streamManager, "createStopWhenCondition") as
+      | BuildStopWhenCondition
+      | undefined;
+    expect(typeof buildStopWhen).toBe("function");
+
+    let queued = false;
+    const stopWhen = buildStopWhen!({ hasQueuedMessage: () => queued });
+    if (!Array.isArray(stopWhen)) {
+      throw new Error("Expected autonomous stopWhen to be an array of conditions");
+    }
+    expect(stopWhen).toHaveLength(2);
+
+    const [maxStepCondition, queuedMessageCondition] = stopWhen;
+    expect(maxStepCondition({ steps: new Array(99999) })).toBe(false);
+    expect(maxStepCondition({ steps: new Array(100000) })).toBe(true);
+
+    expect(queuedMessageCondition({ steps: [] })).toBe(false);
+    queued = true;
+    expect(queuedMessageCondition({ steps: [] })).toBe(true);
+  });
+
+  test("treats missing queued-message callback as not queued", () => {
+    const streamManager = new StreamManager(createMockHistoryService(), createMockPartialService());
+    const buildStopWhen = Reflect.get(streamManager, "createStopWhenCondition") as
+      | BuildStopWhenCondition
+      | undefined;
+    expect(typeof buildStopWhen).toBe("function");
+
+    const stopWhen = buildStopWhen!({});
+    if (!Array.isArray(stopWhen)) {
+      throw new Error("Expected autonomous stopWhen to remain array-based without callback");
+    }
+
+    const [, queuedMessageCondition] = stopWhen;
+    expect(queuedMessageCondition({ steps: [] })).toBe(false);
+  });
+});
+
+describe("StreamManager - stripEncryptedContent", () => {
+  test("strips encryptedContent from array output shape", () => {
+    const output = [
+      {
+        url: "https://example.com/a",
+        title: "Result A",
+        pageAge: "2d",
+        encryptedContent: "secret-a",
+      },
+      {
+        url: "https://example.com/b",
+        title: "Result B",
+      },
+      "non-object-item",
+    ];
+
+    expect(stripEncryptedContent(output)).toEqual([
+      {
+        url: "https://example.com/a",
+        title: "Result A",
+        pageAge: "2d",
+      },
+      {
+        url: "https://example.com/b",
+        title: "Result B",
+      },
+      "non-object-item",
+    ]);
+  });
+
+  test("strips encryptedContent from json value output shape", () => {
+    const output = {
+      type: "json",
+      value: [
+        {
+          url: "https://example.com/c",
+          title: "Result C",
+          encryptedContent: "secret-c",
+        },
+        {
+          url: "https://example.com/d",
+          title: "Result D",
+          pageAge: "5h",
+        },
+      ],
+      source: "web_search",
+    };
+
+    expect(stripEncryptedContent(output)).toEqual({
+      type: "json",
+      value: [
+        {
+          url: "https://example.com/c",
+          title: "Result C",
+        },
+        {
+          url: "https://example.com/d",
+          title: "Result D",
+          pageAge: "5h",
+        },
+      ],
+      source: "web_search",
+    });
   });
 });
 
