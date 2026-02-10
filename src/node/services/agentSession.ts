@@ -156,6 +156,13 @@ interface AgentSessionOptions {
   onPostCompactionStateChange?: () => void;
 }
 
+enum TurnPhase {
+  IDLE = "idle",
+  PREPARING = "preparing",
+  STREAMING = "streaming",
+  COMPLETING = "completing",
+}
+
 export class AgentSession {
   private readonly workspaceId: string;
   private readonly config: Config;
@@ -172,7 +179,10 @@ export class AgentSession {
   private readonly initListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
     [];
   private disposed = false;
-  private streamStarting = false;
+  private turnPhase: TurnPhase = TurnPhase.IDLE;
+  // When true, stream-end skips auto-flushing queued messages so an edit can truncate first.
+  private deferQueuedFlushUntilAfterEdit = false;
+  private idleWaiters: Array<() => void> = [];
   private readonly messageQueue = new MessageQueue();
   private readonly compactionHandler: CompactionHandler;
 
@@ -282,6 +292,9 @@ export class AgentSession {
       return;
     }
     this.disposed = true;
+
+    // Ensure any callers blocked on waitForIdle() can continue during teardown.
+    this.setTurnPhase(TurnPhase.IDLE);
 
     // Stop any active stream (fire and forget - disposal shouldn't block)
     void this.aiService.stopStream(this.workspaceId, { abandonPartial: true });
@@ -535,13 +548,40 @@ export class AgentSession {
     }
 
     if (editMessageId) {
-      // Interrupt an existing stream or compaction, if active
-      if (this.aiService.isStreaming(this.workspaceId)) {
-        // MUST use abandonPartial=true to prevent handleAbort from performing partial compaction
-        // with mismatched history (since we're about to truncate it)
-        const stopResult = await this.interruptStream({ abandonPartial: true });
-        if (!stopResult.success) {
-          return Err(createUnknownSendMessageError(stopResult.error));
+      // Ensure no in-flight completion code can append after we truncate.
+      if (this.isBusy()) {
+        // If a turn is still PREPARING/STREAMING, interrupt aggressively — history is about to be
+        // truncated.
+        //
+        // If we're already COMPLETING, do NOT call stopStream(): StreamManager will emit a
+        // synthetic stream-abort when no stream is active, which can incorrectly transition us to
+        // IDLE while completion cleanup is still in-flight.
+        if (this.turnPhase !== TurnPhase.COMPLETING) {
+          // MUST use abandonPartial=true to prevent handleAbort from performing partial compaction
+          // with mismatched history (since we're about to truncate it).
+          const stopResult = await this.interruptStream({ abandonPartial: true });
+          if (!stopResult.success) {
+            log.warn("Failed to interrupt stream before edit", {
+              workspaceId: this.workspaceId,
+              editMessageId,
+              error: stopResult.error,
+            });
+            return Err(createUnknownSendMessageError(stopResult.error));
+          }
+        }
+
+        // Tell stream-end to skip sendQueuedMessages() so the edit truncates first.
+        this.deferQueuedFlushUntilAfterEdit = true;
+        try {
+          await this.waitForIdle();
+
+          // Workspace teardown does not await in-flight async work; bail out if the session was
+          // disposed while waiting for completion cleanup.
+          if (this.disposed) {
+            return Ok(undefined);
+          }
+        } finally {
+          this.deferQueuedFlushUntilAfterEdit = false;
         }
       }
 
@@ -781,7 +821,7 @@ export class AgentSession {
     // Add type: "message" for discriminated union (createMuxMessage doesn't add it)
     this.emitChatEvent({ ...userMessage, type: "message" });
 
-    this.streamStarting = true;
+    this.setTurnPhase(TurnPhase.PREPARING);
 
     try {
       // If this is a compaction request, terminate background processes first
@@ -802,13 +842,15 @@ export class AgentSession {
         return Ok(undefined);
       }
 
-      // Must await here so the finally block runs after streaming completes,
-      // not immediately when the Promise is returned. This keeps streamStarting=true
-      // for the entire duration of streaming, allowing follow-up messages to be queued.
+      // Must await here so errors propagate back to sendMessage() callers.
+      // Turn-phase transitions for success are driven by stream events.
       const result = await this.streamWithHistory(modelForStream, optionsForStream);
       return result;
     } finally {
-      this.streamStarting = false;
+      // Only transition to IDLE on failure; success transitions are driven by stream events.
+      if (this.turnPhase === TurnPhase.PREPARING) {
+        this.setTurnPhase(TurnPhase.IDLE);
+      }
     }
   }
 
@@ -833,19 +875,21 @@ export class AgentSession {
       : normalizedOptions;
 
     // Guard against auto-retry starting a second stream while the initial send is
-    // still waiting for init hooks to complete.
-    if (this.streamStarting || this.aiService.isStreaming(this.workspaceId)) {
+    // still waiting for init hooks to complete (or while completion cleanup is running).
+    if (this.isBusy()) {
       return Ok(undefined);
     }
 
-    this.streamStarting = true;
+    this.setTurnPhase(TurnPhase.PREPARING);
     try {
       // Must await here so the finally block runs after streaming completes,
       // not immediately when the Promise is returned.
       const result = await this.streamWithHistory(modelForStream, optionsForStream);
       return result;
     } finally {
-      this.streamStarting = false;
+      if (this.turnPhase === TurnPhase.PREPARING) {
+        this.setTurnPhase(TurnPhase.IDLE);
+      }
     }
   }
 
@@ -999,7 +1043,11 @@ export class AgentSession {
       system1Model: options?.system1Model,
       system1ThinkingLevel: options?.system1ThinkingLevel,
       disableWorkspaceAgents: options?.disableWorkspaceAgents,
-      hasQueuedMessage: () => !this.messageQueue.isEmpty(),
+      // Edit turns suppress the queued-message stop condition. The defer path may intentionally
+      // leave messageQueue populated so the edit can truncate first; we must not let that stale
+      // queue cut the edit's stream short at a step boundary. The edit's own stream-end will
+      // drain the queue via sendQueuedMessages().
+      hasQueuedMessage: options?.editMessageId ? undefined : () => !this.messageQueue.isEmpty(),
       openaiTruncationModeOverride,
     });
 
@@ -1180,7 +1228,7 @@ export class AgentSession {
     const retryOptions = is1MCapable
       ? this.withAnthropic1MContext(context.modelString, context.options)
       : context.options;
-    this.streamStarting = true;
+    this.setTurnPhase(TurnPhase.PREPARING);
     let retryResult: Result<void, SendMessageError>;
     try {
       retryResult = await this.streamWithHistory(
@@ -1189,7 +1237,9 @@ export class AgentSession {
         isGptClass ? "auto" : undefined
       );
     } finally {
-      this.streamStarting = false;
+      if (this.turnPhase === TurnPhase.PREPARING) {
+        this.setTurnPhase(TurnPhase.IDLE);
+      }
     }
     if (!retryResult.success) {
       log.error("Compaction retry failed to start", {
@@ -1259,7 +1309,7 @@ export class AgentSession {
     await this.clearFailedAssistantMessage(data.messageId, "post-compaction-retry");
 
     // Retry the same request, but without post-compaction injection.
-    this.streamStarting = true;
+    this.setTurnPhase(TurnPhase.PREPARING);
     let retryResult: Result<void, SendMessageError>;
     try {
       retryResult = await this.streamWithHistory(
@@ -1269,7 +1319,9 @@ export class AgentSession {
         true
       );
     } finally {
-      this.streamStarting = false;
+      if (this.turnPhase === TurnPhase.PREPARING) {
+        this.setTurnPhase(TurnPhase.IDLE);
+      }
     }
 
     if (!retryResult.success) {
@@ -1551,7 +1603,7 @@ export class AgentSession {
           },
         };
 
-    this.streamStarting = true;
+    this.setTurnPhase(TurnPhase.PREPARING);
     let retryResult: Result<void, SendMessageError>;
     try {
       retryResult = await this.streamWithHistory(
@@ -1560,7 +1612,9 @@ export class AgentSession {
         context.openaiTruncationModeOverride
       );
     } finally {
-      this.streamStarting = false;
+      if (this.turnPhase === TurnPhase.PREPARING) {
+        this.setTurnPhase(TurnPhase.IDLE);
+      }
     }
 
     if (!retryResult.success) {
@@ -1583,6 +1637,8 @@ export class AgentSession {
   }
 
   private async handleStreamError(data: StreamErrorPayload): Promise<void> {
+    this.setTurnPhase(TurnPhase.COMPLETING);
+
     const hadCompactionRequest = this.activeCompactionRequest !== undefined;
     if (
       await this.maybeRetryCompactionOnContextExceeded({
@@ -1590,7 +1646,7 @@ export class AgentSession {
         errorType: data.errorType,
       })
     ) {
-      return;
+      return; // retry set PREPARING
     }
 
     if (
@@ -1599,7 +1655,7 @@ export class AgentSession {
         errorType: data.errorType,
       })
     ) {
-      return;
+      return; // retry set PREPARING
     }
 
     if (
@@ -1608,9 +1664,10 @@ export class AgentSession {
         errorType: data.errorType,
       })
     ) {
-      return;
+      return; // retry set PREPARING
     }
 
+    // Terminal error — no retry succeeded
     this.activeCompactionRequest = undefined;
     this.resetActiveStreamState();
 
@@ -1619,6 +1676,7 @@ export class AgentSession {
     }
 
     this.emitChatEvent(createStreamErrorMessage(data));
+    this.setTurnPhase(TurnPhase.IDLE);
   }
 
   private attachAiListeners(): void {
@@ -1642,7 +1700,10 @@ export class AgentSession {
       this.aiService.on(event, wrapped as never);
     };
 
-    forward("stream-start", (payload) => this.emitChatEvent(payload));
+    forward("stream-start", (payload) => {
+      this.setTurnPhase(TurnPhase.STREAMING);
+      this.emitChatEvent(payload);
+    });
     forward("stream-delta", (payload) => {
       this.activeStreamHadAnyDelta = true;
       this.emitChatEvent(payload);
@@ -1679,6 +1740,23 @@ export class AgentSession {
     forward("reasoning-end", (payload) => this.emitChatEvent(payload));
     forward("usage-delta", (payload) => this.emitChatEvent(payload));
     forward("stream-abort", (payload) => {
+      // stopStream() emits synthetic aborts even when no real stream is active
+      // (e.g., during PREPARING or after COMPLETING). We must still forward the
+      // event to the renderer so it clears "starting…" / "interrupting…" UI, but
+      // we must NOT clobber the turn phase or reset stream state — the originating
+      // code path handles its own transition back to IDLE:
+      //   PREPARING → sendMessage error handler / sendQueuedMessages .then() handler
+      //   COMPLETING → stream-end finally block
+      if (this.turnPhase !== TurnPhase.STREAMING) {
+        log.debug("Forwarding stream-abort without phase transition (not in STREAMING)", {
+          workspaceId: this.workspaceId,
+          turnPhase: this.turnPhase,
+        });
+        this.emitChatEvent(payload);
+        return;
+      }
+
+      this.setTurnPhase(TurnPhase.COMPLETING);
       const hadCompactionRequest = this.activeCompactionRequest !== undefined;
       this.activeCompactionRequest = undefined;
       this.resetActiveStreamState();
@@ -1686,49 +1764,80 @@ export class AgentSession {
         this.clearQueue();
       }
       this.emitChatEvent(payload);
+      this.setTurnPhase(TurnPhase.IDLE);
     });
     forward("runtime-status", (payload) => this.emitChatEvent(payload));
 
     forward("stream-end", async (payload) => {
-      this.activeCompactionRequest = undefined;
-      const handled = await this.compactionHandler.handleCompletion(payload as StreamEndEvent);
+      this.setTurnPhase(TurnPhase.COMPLETING);
 
-      if (!handled) {
-        this.emitChatEvent(payload);
+      let emittedStreamEnd = false;
+      try {
+        this.activeCompactionRequest = undefined;
+        const handled = await this.compactionHandler.handleCompletion(payload as StreamEndEvent);
 
-        if (this.ackPendingPostCompactionStateOnStreamEnd) {
-          this.ackPendingPostCompactionStateOnStreamEnd = false;
-          try {
-            await this.compactionHandler.ackPendingDiffsConsumed();
-          } catch (error) {
-            log.warn("Failed to ack pending post-compaction state", {
-              workspaceId: this.workspaceId,
-              error: error instanceof Error ? error.message : String(error),
-            });
+        if (!handled) {
+          this.emitChatEvent(payload);
+          emittedStreamEnd = true;
+
+          if (this.ackPendingPostCompactionStateOnStreamEnd) {
+            this.ackPendingPostCompactionStateOnStreamEnd = false;
+            try {
+              await this.compactionHandler.ackPendingDiffsConsumed();
+            } catch (error) {
+              log.warn("Failed to ack pending post-compaction state", {
+                workspaceId: this.workspaceId,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
+            this.onPostCompactionStateChange?.();
           }
-          this.onPostCompactionStateChange?.();
+        } else {
+          // CompactionHandler emits its own sanitized stream-end; mark as handled
+          // so the catch block doesn't re-emit the unsanitized original payload.
+          emittedStreamEnd = true;
+          this.onCompactionComplete?.();
         }
-      } else {
-        // Compaction completed - notify to trigger metadata refresh
-        // This allows the frontend to get updated postCompaction state
-        this.onCompactionComplete?.();
 
-        // Dispatch any pending follow-up from the compaction summary.
-        // The follow-up is stored on the summary for crash safety - if the app
-        // crashes after compaction but before this dispatch, startup recovery
-        // will detect the pending follow-up and dispatch it.
-        //
-        // IMPORTANT: await to ensure the follow-up message is persisted before
-        // sendQueuedMessages runs. Otherwise a queued message could append first,
-        // causing dispatchPendingFollowUp to skip (since summary would no longer
-        // be the last message).
-        await this.dispatchPendingFollowUp();
+        // IMPORTANT: reset BEFORE anything that can start a new stream,
+        // so the next turn doesn't get its state clobbered by our cleanup.
+        this.resetActiveStreamState();
+
+        if (handled) {
+          // Dispatch follow-up AFTER reset so it can set its own stream state.
+          await this.dispatchPendingFollowUp();
+        }
+
+        // Stream end: auto-send queued messages (for user messages typed during streaming)
+        // P2: if an edit is waiting, skip the queue flush so the edit truncates first.
+        if (this.deferQueuedFlushUntilAfterEdit) {
+          // Clear the queued message flag so the next turn's tools don't early-return.
+          this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
+        } else {
+          this.sendQueuedMessages();
+        }
+      } catch (error) {
+        log.error("stream-end cleanup failed", {
+          workspaceId: this.workspaceId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+
+        // Defense-in-depth: unblock renderer if compaction handler threw before we emitted.
+        if (!emittedStreamEnd) {
+          try {
+            this.emitChatEvent(payload);
+          } catch {
+            // Best-effort; don't mask the original error.
+          }
+        }
+      } finally {
+        // Only clean up if we're still in COMPLETING — a new turn started by
+        // dispatchPendingFollowUp() or sendQueuedMessages() owns the stream state now.
+        if (this.turnPhase === TurnPhase.COMPLETING) {
+          this.resetActiveStreamState();
+          this.setTurnPhase(TurnPhase.IDLE);
+        }
       }
-
-      this.resetActiveStreamState();
-
-      // Stream end: auto-send queued messages (for user messages typed during streaming)
-      this.sendQueuedMessages();
     });
 
     const errorHandler = (...args: unknown[]) => {
@@ -1794,8 +1903,37 @@ export class AgentSession {
     } satisfies AgentSessionChatEvent);
   }
 
+  private setTurnPhase(next: TurnPhase): void {
+    this.turnPhase = next;
+
+    if (next === TurnPhase.IDLE) {
+      const waiters = this.idleWaiters;
+      this.idleWaiters = [];
+      for (const resolve of waiters) {
+        resolve();
+      }
+    }
+  }
+
+  isBusy(): boolean {
+    return this.turnPhase !== TurnPhase.IDLE;
+  }
+
+  isPreparingTurn(): boolean {
+    return this.turnPhase === TurnPhase.PREPARING;
+  }
+
+  // Back-compat alias; prefer isPreparingTurn() + isBusy().
   isStreamStarting(): boolean {
-    return this.streamStarting;
+    return this.isPreparingTurn();
+  }
+
+  async waitForIdle(): Promise<void> {
+    if (this.turnPhase === TurnPhase.IDLE) {
+      return;
+    }
+
+    await new Promise<void>((resolve) => this.idleWaiters.push(resolve));
   }
 
   queueMessage(message: string, options?: SendMessageOptions & { fileParts?: FilePart[] }): void {
@@ -1868,7 +2006,23 @@ export class AgentSession {
       this.messageQueue.clear();
       this.emitQueuedMessageChanged();
 
-      void this.sendMessage(message, options);
+      // Set PREPARING synchronously before the async sendMessage to prevent
+      // incoming messages from bypassing the queue during the await gap.
+      this.setTurnPhase(TurnPhase.PREPARING);
+
+      void this.sendMessage(message, options)
+        .then((result) => {
+          // If sendMessage fails before it can start streaming, ensure we don't
+          // leave the session stuck in PREPARING.
+          if (!result.success && this.turnPhase === TurnPhase.PREPARING) {
+            this.setTurnPhase(TurnPhase.IDLE);
+          }
+        })
+        .catch(() => {
+          if (this.turnPhase === TurnPhase.PREPARING) {
+            this.setTurnPhase(TurnPhase.IDLE);
+          }
+        });
     }
   }
 
