@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect } from "react";
+import * as SelectPrimitive from "@radix-ui/react-select";
 import {
   RUNTIME_MODE,
   type CoderWorkspaceConfig,
@@ -271,6 +272,20 @@ interface SectionPickerProps {
   disabled?: boolean;
 }
 
+function SectionSelectItem(props: { section: SectionConfig }) {
+  const color = resolveSectionColor(props.section.color);
+
+  return (
+    <SelectPrimitive.Item
+      value={props.section.id}
+      className="hover:bg-hover focus:bg-hover flex cursor-default items-center gap-2.5 rounded-sm px-3 py-1.5 text-sm font-medium outline-none select-none data-[disabled]:pointer-events-none data-[disabled]:opacity-50"
+    >
+      <span className="size-2.5 shrink-0 rounded-full" style={{ backgroundColor: color }} />
+      <SelectPrimitive.ItemText>{props.section.name}</SelectPrimitive.ItemText>
+    </SelectPrimitive.Item>
+  );
+}
+
 function SectionPicker(props: SectionPickerProps) {
   const { sections, selectedSectionId, onSectionChange, disabled } = props;
 
@@ -286,45 +301,48 @@ function SectionPicker(props: SectionPickerProps) {
 
   return (
     <div
-      className="inline-flex w-fit items-center gap-2.5 rounded-md border px-3 py-1.5 transition-colors"
-      style={{
-        borderColor: selectedSection ? sectionColor : "var(--color-border-medium)",
-        borderLeftWidth: selectedSection ? "3px" : "1px",
-        backgroundColor: selectedSection ? `${sectionColor}08` : "transparent",
-      }}
+      className="relative inline-flex items-center"
       data-testid="section-selector"
       data-selected-section={normalizedSelectedSectionId ?? ""}
     >
-      {/* Color indicator dot */}
-      <div
-        className="size-2.5 shrink-0 rounded-full transition-colors"
-        style={{
-          backgroundColor: selectedSection ? sectionColor : "var(--color-muted)",
-          opacity: selectedSection ? 1 : 0.4,
-        }}
-      />
-      <label className="text-muted-foreground shrink-0 text-xs">Section</label>
       <RadixSelect
         value={normalizedSelectedSectionId ?? ""}
         onValueChange={(value) => onSectionChange(value.trim() ? value : null)}
         disabled={disabled}
       >
+        {/* Trigger IS the full pill so Radix aligns the dropdown to it. */}
         <SelectTrigger
           className={cn(
-            "h-auto border-0 bg-transparent px-0 py-0 text-sm font-medium shadow-none focus:ring-0",
+            "inline-flex h-auto w-auto items-center gap-2.5 rounded-md border bg-transparent py-1.5 pl-3 text-sm font-medium shadow-none transition-colors focus:ring-0",
+            normalizedSelectedSectionId ? "pr-8" : "pr-3",
             selectedSection ? "text-foreground" : "text-muted"
           )}
+          style={{
+            borderColor: selectedSection ? sectionColor : "var(--color-border-medium)",
+            borderLeftWidth: selectedSection ? "3px" : "1px",
+            backgroundColor: selectedSection ? `${sectionColor}08` : "transparent",
+          }}
         >
+          {/* Color indicator dot */}
+          <div
+            className="size-2.5 shrink-0 rounded-full transition-colors"
+            style={{
+              backgroundColor: selectedSection ? sectionColor : "var(--color-muted)",
+              opacity: selectedSection ? 1 : 0.4,
+            }}
+          />
+          <span className="text-muted-foreground shrink-0 text-xs">Section</span>
           <SelectValue placeholder="Select..." />
         </SelectTrigger>
-        <SelectContent>
+        <SelectContent className="border-border-medium">
           {sections.map((section) => (
-            <SelectItem key={section.id} value={section.id}>
-              {section.name}
-            </SelectItem>
+            <SectionSelectItem key={section.id} section={section} />
           ))}
         </SelectContent>
       </RadixSelect>
+      {/* Clear button is a sibling (not nested in the trigger) to avoid
+          nesting interactive elements. Absolutely positioned over the
+          right padding reserved by the trigger's pr-8. */}
       {normalizedSelectedSectionId && (
         <Tooltip>
           <TooltipTrigger asChild>
@@ -338,7 +356,7 @@ function SectionPicker(props: SectionPickerProps) {
                 onSectionChange(null);
               }}
               className={cn(
-                "text-muted hover:text-error -mr-1 inline-flex size-5 items-center justify-center rounded-sm transition-colors",
+                "text-muted hover:text-error absolute right-1.5 top-1/2 -translate-y-1/2 inline-flex size-5 items-center justify-center rounded-sm transition-colors",
                 "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent",
                 "disabled:pointer-events-none disabled:opacity-50"
               )}
