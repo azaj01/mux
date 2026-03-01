@@ -1151,21 +1151,59 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       // Check if the file is already open
       const allTabs = collectAllTabs(layout.root);
       if (allTabs.includes(fileTabType)) {
-        // File already open - just select it
-        const tabsetId = collectAllTabsWithTabset(layout.root).find(
+        // File already open — select it and refresh the parent to the current
+        // active tab so closing always returns to the most recent origin.
+        // Only update parentTab when the origin is in the same tabset as the
+        // file tab; a cross-tabset parent can never be activated on close.
+        const fileTabsetId = collectAllTabsWithTabset(layout.root).find(
           (t) => t.tab === fileTabType
         )?.tabsetId;
-        if (tabsetId) {
+        if (fileTabsetId) {
           setLayout((prev) => {
-            const withFocus = setFocusedTabset(prev, tabsetId);
-            return selectTabInTabset(withFocus, tabsetId, fileTabType);
+            const focused = findTabset(prev.root, prev.focusedTabsetId);
+            const parentTabId = focused?.type === "tabset" ? focused.activeTab : undefined;
+            const withFocus = setFocusedTabset(prev, fileTabsetId);
+            const next = selectTabInTabset(withFocus, fileTabsetId, fileTabType);
+            // Only record the parent when the origin tab lives in the same
+            // tabset as the file — cross-tabset parents would never activate.
+            // When reopening from a different tabset, clear any stale parent
+            // entry so close falls back to positional adjacency.
+            const sameTabset = prev.focusedTabsetId === fileTabsetId;
+            if (parentTabId && parentTabId !== fileTabType && sameTabset) {
+              return {
+                ...next,
+                parentTab: { ...next.parentTab, [fileTabType]: parentTabId },
+              };
+            }
+            // Cross-tabset reopen: clear stale parent to avoid jumping to
+            // an outdated origin tab on close.
+            if (!sameTabset && next.parentTab?.[fileTabType]) {
+              const { [fileTabType]: _, ...rest } = next.parentTab;
+              return {
+                ...next,
+                parentTab: Object.keys(rest).length > 0 ? rest : undefined,
+              };
+            }
+            return next;
           });
         }
         return;
       }
 
-      // Add new file tab to the focused tabset
-      setLayout((prev) => addTabToFocusedTabset(prev, fileTabType));
+      // Add new file tab to the focused tabset, recording the currently active
+      // tab as its parent so closing the file returns to where the user was.
+      setLayout((prev) => {
+        const focused = findTabset(prev.root, prev.focusedTabsetId);
+        const parentTabId = focused?.type === "tabset" ? focused.activeTab : undefined;
+        const next = addTabToFocusedTabset(prev, fileTabType);
+        if (parentTabId) {
+          return {
+            ...next,
+            parentTab: { ...next.parentTab, [fileTabType]: parentTabId },
+          };
+        }
+        return next;
+      });
     },
     [layout.root, setLayout]
   );
