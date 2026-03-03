@@ -1007,7 +1007,8 @@ export class AIService extends EventEmitter {
         (id) => this.streamManager.isResponseIdLost(id),
         effectiveMuxProviderOptions,
         workspaceId,
-        truncationMode
+        truncationMode,
+        this.providerService.getConfig()
       );
 
       // Build per-request HTTP headers (e.g., workspace correlation and
@@ -1017,7 +1018,8 @@ export class AIService extends EventEmitter {
       const requestHeaders = buildRequestHeaders(
         modelString,
         effectiveMuxProviderOptions,
-        workspaceId
+        workspaceId,
+        this.providerService.getConfig()
       );
 
       // Debug dump: Log the complete LLM request when MUX_DEBUG_LLM_REQUEST is set
