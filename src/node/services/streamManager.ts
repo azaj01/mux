@@ -68,7 +68,9 @@ import { normalizeLiteralRequiredToolPattern } from "@/common/utils/agentTools";
 globalThis.AI_SDK_LOG_WARNINGS = false;
 
 const EMPTY_STREAM_OUTPUT_ERROR_MESSAGE =
-  "The provider ended the stream before any assistant output arrived. This usually means the stream was dropped upstream rather than completed normally. Retry to continue.";
+  "The model ended the stream before producing any assistant-visible output. This usually means the upstream stream was dropped rather than completed normally. Mux will retry automatically when possible, and if retries keep failing you should try again or switch models.";
+
+const MAX_EMPTY_STREAM_RECOVERY_ATTEMPTS = 1;
 
 class EmptyStreamOutputError extends Error {
   constructor() {
@@ -347,6 +349,10 @@ interface WorkspaceStreamInfo {
   // Track if a previousResponseId retry happened after a step completed so
   // stream-end uses cumulative usage instead of the retried step's totalUsage.
   didRetryPreviousResponseIdAtStep: boolean;
+  // Track when Mux restarted the stream after an empty-output completion so
+  // stream-end prefers cumulative usage across attempts instead of the final
+  // attempt's totalUsage only.
+  didRetryAfterEmptyOutput?: boolean;
   // Index into parts where the current step started (used to ensure safe retries)
   currentStepStartIndex: number;
   historySequence: number;
@@ -673,6 +679,7 @@ export class StreamManager extends EventEmitter {
     totalUsage?: LanguageModelV2Usage;
     contextUsage?: LanguageModelV2Usage;
     contextProviderMetadata?: Record<string, unknown>;
+    finishReason?: string;
     duration: number;
   }> {
     // Helper: wrap promise with independent timeout + error handling
@@ -687,16 +694,23 @@ export class StreamManager extends EventEmitter {
     // - totalUsage: sum of all steps (for cost calculation)
     // - contextUsage: last step only (for context window display)
     // - contextProviderMetadata: last step (for context window cache display)
-    const [totalUsage, contextUsage, contextProviderMetadata] = await Promise.all([
+    const streamResultWithFinishReason = streamInfo.streamResult as {
+      finishReason?: PromiseLike<string>;
+    };
+    const [totalUsage, contextUsage, contextProviderMetadata, finishReason] = await Promise.all([
       withTimeout(streamInfo.streamResult.totalUsage),
       withTimeout(streamInfo.streamResult.usage),
       withTimeout(streamInfo.streamResult.providerMetadata),
+      streamResultWithFinishReason.finishReason
+        ? withTimeout(streamResultWithFinishReason.finishReason)
+        : Promise.resolve(undefined),
     ]);
 
     return {
       totalUsage,
       contextUsage,
       contextProviderMetadata,
+      finishReason,
       duration: Date.now() - streamInfo.startTime,
     };
   }
@@ -713,7 +727,10 @@ export class StreamManager extends EventEmitter {
       (cumulativeUsage.totalTokens ?? 0) > 0 ||
       (cumulativeUsage.cachedInputTokens ?? 0) > 0 ||
       (cumulativeUsage.reasoningTokens ?? 0) > 0;
-    if (streamInfo.didRetryPreviousResponseIdAtStep && hasCumulativeUsage) {
+    if (
+      (streamInfo.didRetryPreviousResponseIdAtStep || streamInfo.didRetryAfterEmptyOutput) &&
+      hasCumulativeUsage
+    ) {
       return cumulativeUsage;
     }
 
@@ -1369,6 +1386,7 @@ export class StreamManager extends EventEmitter {
       thinkingLevel,
       initialMetadata,
       didRetryPreviousResponseIdAtStep: false,
+      didRetryAfterEmptyOutput: false,
       stepTracker,
       currentStepStartIndex: 0,
       request,
@@ -1676,6 +1694,46 @@ export class StreamManager extends EventEmitter {
     await this.handleStreamFailure(workspaceId, streamInfo, new EmptyStreamOutputError());
   }
 
+  private async retryEmptyStreamBeforeFailure(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    emptyStreamRecoveryAttempts: number
+  ): Promise<boolean> {
+    if (emptyStreamRecoveryAttempts >= MAX_EMPTY_STREAM_RECOVERY_ATTEMPTS) {
+      return false;
+    }
+
+    if (streamInfo.abortController.signal.aborted || streamInfo.softInterrupt.pending) {
+      return false;
+    }
+
+    if (streamInfo.parts.length > 0) {
+      return false;
+    }
+
+    const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
+    workspaceLog.warn("Retrying stream after empty-output completion", {
+      messageId: streamInfo.messageId,
+      model: streamInfo.model,
+      nextAttempt: emptyStreamRecoveryAttempts + 1,
+      maxAttempts: MAX_EMPTY_STREAM_RECOVERY_ATTEMPTS,
+      previousResponseId: this.getOpenAIPreviousResponseId(streamInfo.request.providerOptions),
+    });
+
+    streamInfo.didRetryAfterEmptyOutput = true;
+    await this.resetStreamStateForRetry(workspaceId, streamInfo, {
+      preserveUsage: true,
+      workspaceLog,
+    });
+    streamInfo.currentStepStartIndex = 0;
+    streamInfo.streamResult = this.createStreamResult(
+      streamInfo.request,
+      streamInfo.abortController,
+      streamInfo.stepTracker
+    );
+    return true;
+  }
+
   /**
    * Processes a stream with guaranteed cleanup, regardless of success or failure
    */
@@ -1697,6 +1755,7 @@ export class StreamManager extends EventEmitter {
       await this.tokenTracker.setModel(streamInfo.model, streamInfo.metadataModel);
 
       let didRetryPreviousResponseId = false;
+      let emptyStreamRecoveryAttempts = 0;
       const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
       let orphanToolResultCount = 0;
 
@@ -2057,6 +2116,16 @@ export class StreamManager extends EventEmitter {
           // Check if stream completed successfully
           if (!streamInfo.abortController.signal.aborted) {
             if (streamInfo.parts.length === 0) {
+              const retriedEmptyStream = await this.retryEmptyStreamBeforeFailure(
+                workspaceId,
+                streamInfo,
+                emptyStreamRecoveryAttempts
+              );
+              if (retriedEmptyStream) {
+                emptyStreamRecoveryAttempts += 1;
+                continue;
+              }
+
               await this.handleEmptyStreamCompletion(workspaceId, streamInfo);
               break;
             }
@@ -2076,6 +2145,7 @@ export class StreamManager extends EventEmitter {
             const contextUsage = streamMeta.contextUsage ?? streamInfo.lastStepUsage;
             const contextProviderMetadata =
               streamMeta.contextProviderMetadata ?? streamInfo.lastStepProviderMetadata;
+            const finishReason = streamMeta.finishReason;
             const duration = streamMeta.duration;
             const ttftMs = this.resolveTtftMsForStreamEnd(streamInfo);
             // Aggregated provider metadata across all steps (for cost calculation with cache tokens)
@@ -2107,6 +2177,7 @@ export class StreamManager extends EventEmitter {
                 contextUsage, // Last step only (for context window display)
                 providerMetadata, // Aggregated (for cost calculation)
                 contextProviderMetadata, // Last step (for context window display)
+                ...(finishReason !== undefined && { finishReason }),
                 duration,
                 ...(ttftMs !== undefined && { ttftMs }),
               },
@@ -2254,7 +2325,7 @@ export class StreamManager extends EventEmitter {
       return {
         messageId: streamInfo.messageId,
         error: error.message,
-        errorType: "unknown",
+        errorType: "empty_output",
         acpPromptId: streamInfo.initialMetadata?.acpPromptId,
       };
     }

@@ -60,7 +60,7 @@ import { AgentIdSchema } from "@/common/orpc/schemas";
 import { GitPatchArtifactService } from "@/node/services/gitPatchArtifactService";
 import { getWorkspaceProjectRepos } from "@/node/services/workspaceProjectRepos";
 import type { ThinkingLevel } from "@/common/types/thinking";
-import type { StreamEndEvent } from "@/common/types/stream";
+import type { ErrorEvent, StreamEndEvent } from "@/common/types/stream";
 import { isDynamicToolPart, type DynamicToolPart } from "@/common/types/toolParts";
 import {
   AgentReportToolArgsSchema,
@@ -83,6 +83,7 @@ import {
 } from "@/node/services/subagentReportArtifacts";
 import { secretsToRecord, type ExternalSecretResolver } from "@/common/types/secrets";
 import { getErrorMessage } from "@/common/utils/errors";
+import { isNonRetryableStreamError } from "@/common/utils/messages/retryEligibility";
 import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
 
 export type TaskKind = "agent";
@@ -204,6 +205,10 @@ function isStreamEndEvent(value: unknown): value is StreamEndEvent {
   return isTypedWorkspaceEvent(value, "stream-end");
 }
 
+function isErrorEvent(value: unknown): value is ErrorEvent {
+  return isTypedWorkspaceEvent(value, "error");
+}
+
 function hasAncestorWorkspaceId(
   entry: { ancestorWorkspaceIds?: unknown } | null | undefined,
   ancestorWorkspaceId: string
@@ -313,7 +318,6 @@ export class TaskService {
   // Bounded by max entries; disk persistence is the source of truth for restart-safety.
   private readonly completedReportsByTaskId = new Map<string, CompletedAgentReportCacheEntry>();
   private readonly gitPatchArtifactService: GitPatchArtifactService;
-  private readonly remindedAwaitingReport = new Set<string>();
   private readonly handoffInProgress = new Set<string>();
   /**
    * Hard-interrupted parent workspaces must not auto-resume until the next user message.
@@ -354,6 +358,18 @@ export class TaskService {
         })
         .catch((error: unknown) => {
           log.error("TaskService.handleStreamEnd failed", { error });
+        });
+    });
+
+    this.aiService.on("error", (payload: unknown) => {
+      if (!isErrorEvent(payload)) return;
+
+      void this.workspaceEventLocks
+        .withLock(payload.workspaceId, async () => {
+          await this.handleTaskStreamError(payload);
+        })
+        .catch((error: unknown) => {
+          log.error("TaskService.handleTaskStreamError failed", { error });
         });
     });
   }
@@ -839,74 +855,15 @@ export class TaskService {
         continue;
       }
 
-      // Restart-safety: if this task stream ends again without its required completion tool,
-      // fall back immediately.
-      this.remindedAwaitingReport.add(task.id);
-
-      const isPlanLike = await this.isPlanLikeTaskWorkspace({
-        projectPath: task.projectPath,
-        workspace: task,
+      const resumed = await this.promptTaskForRequiredCompletionTool(task.id, {
+        reason: "startup",
       });
-      const completionToolName = isPlanLike ? "propose_plan" : "agent_report";
-
-      const model = task.taskModelString ?? defaultModel;
-      const agentId = task.agentId ?? TASK_RECOVERY_FALLBACK_AGENT_ID;
-      log.info("[startup] Resuming awaiting_report task", {
-        taskId: task.id,
-        taskName: task.name,
-        projectPath: task.projectPath,
-        model,
-        agentId,
-        completionToolName,
-      });
-      const resumeStartedAt = Date.now();
-      const sendResult = await this.workspaceService.sendMessage(
-        task.id,
-        isPlanLike
-          ? "This task is awaiting its final propose_plan. Call propose_plan exactly once now."
-          : "This task is awaiting its final agent_report. Call agent_report exactly once now.",
-        {
-          model,
-          agentId,
-          thinkingLevel: task.taskThinkingLevel,
-          toolPolicy: [{ regex_match: `^${completionToolName}$`, action: "require" }],
-        },
-        { synthetic: true, agentInitiated: true }
-      );
-      const durationMs = Date.now() - resumeStartedAt;
-      if (!sendResult.success) {
+      if (!resumed) {
         failedAwaitingReportCount += 1;
-        log.error("Failed to resume awaiting_report task on startup", {
-          taskId: task.id,
-          taskName: task.name,
-          projectPath: task.projectPath,
-          model,
-          agentId,
-          completionToolName,
-          durationMs,
-          error: sendResult.error,
-        });
-
-        await this.fallbackReportMissingCompletionTool(
-          {
-            projectPath: task.projectPath,
-            workspace: task,
-          },
-          completionToolName
-        );
         continue;
       }
 
       resumedAwaitingReportCount += 1;
-      log.info("[startup] Resumed awaiting_report task", {
-        taskId: task.id,
-        taskName: task.name,
-        projectPath: task.projectPath,
-        model,
-        agentId,
-        completionToolName,
-        durationMs,
-      });
     }
 
     let resumedRunningCount = 0;
@@ -1580,7 +1537,6 @@ export class TaskService {
           log.debug("terminateDescendantAgentTask: stopStream threw", { taskId: id, error });
         }
 
-        this.remindedAwaitingReport.delete(id);
         this.completedReportsByTaskId.delete(id);
         this.rejectWaiters(id, terminationError);
 
@@ -1665,7 +1621,6 @@ export class TaskService {
           log.debug("terminateAllDescendantAgentTasks: stopStream threw", { taskId: id, error });
         }
 
-        this.remindedAwaitingReport.delete(id);
         let preservedCompletedDescendant = false;
         const updated = await this.editWorkspaceEntry(
           id,
@@ -2097,6 +2052,18 @@ export class TaskService {
           startReportTimeout();
         }
 
+        if (initialStatus === "awaiting_report") {
+          void this.workspaceEventLocks
+            .withLock(taskId, async () => {
+              await this.promptTaskForRequiredCompletionTool(taskId, { reason: "waiter" });
+            })
+            .catch((error: unknown) => {
+              log.error("Failed to resume awaiting_report task for waiter", {
+                taskId,
+                error,
+              });
+            });
+        }
         if (options?.abortSignal) {
           if (options.abortSignal.aborted) {
             entry.cleanup();
@@ -3111,6 +3078,115 @@ export class TaskService {
     await this.emitWorkspaceMetadata(workspaceId);
   }
 
+  private buildCompletionToolRecoveryMessage(
+    completionToolName: "agent_report" | "propose_plan",
+    options?: {
+      reason?: "startup" | "stream_end" | "error" | "waiter";
+      error?: Pick<ErrorEvent, "error" | "errorType">;
+    }
+  ): string {
+    const completionToolLabel =
+      completionToolName === "propose_plan" ? "propose_plan" : "agent_report";
+    const completionInstruction =
+      completionToolName === "propose_plan"
+        ? "Call propose_plan exactly once now. Base it only on the planning work already completed in this workspace."
+        : "Call agent_report exactly once now with your final report. Base it only on the work already completed in this workspace.";
+    const noExtraWorkInstruction =
+      completionToolName === "propose_plan"
+        ? "Do not continue planning or call other tools."
+        : "Do not continue investigating or call other tools.";
+
+    switch (options?.reason) {
+      case "startup":
+        return `This task is awaiting its final ${completionToolLabel}. ${noExtraWorkInstruction} ${completionInstruction}`;
+      case "error": {
+        const errorType = options.error?.errorType
+          ? ` (last error: ${options.error.errorType})`
+          : "";
+        return `The previous ${completionToolLabel} attempt failed${errorType}. ${noExtraWorkInstruction} ${completionInstruction}`;
+      }
+      case "waiter":
+        return `A caller is still waiting for ${completionToolLabel} from this task. ${noExtraWorkInstruction} ${completionInstruction}`;
+      case "stream_end":
+      default:
+        return `Your stream ended without calling ${completionToolLabel}. ${noExtraWorkInstruction} ${completionInstruction}`;
+    }
+  }
+
+  private async promptTaskForRequiredCompletionTool(
+    workspaceId: string,
+    options?: {
+      reason?: "startup" | "stream_end" | "error" | "waiter";
+      error?: Pick<ErrorEvent, "error" | "errorType">;
+    }
+  ): Promise<boolean> {
+    assert(
+      workspaceId.length > 0,
+      "promptTaskForRequiredCompletionTool: workspaceId must be non-empty"
+    );
+
+    const cfg = this.config.loadConfigOrDefault();
+    const entry = findWorkspaceEntry(cfg, workspaceId);
+    if (!entry?.workspace.parentWorkspaceId) {
+      return false;
+    }
+    if (entry.workspace.taskStatus !== "awaiting_report") {
+      return false;
+    }
+    if (this.hasActiveDescendantAgentTasks(cfg, workspaceId)) {
+      return false;
+    }
+    if (this.aiService.isStreaming(workspaceId)) {
+      return true;
+    }
+
+    const isPlanLike = await this.isPlanLikeTaskWorkspace(entry);
+    const completionToolName = isPlanLike ? "propose_plan" : "agent_report";
+    const model = entry.workspace.taskModelString ?? defaultModel;
+    const agentId = entry.workspace.agentId ?? TASK_RECOVERY_FALLBACK_AGENT_ID;
+    const startedAt = Date.now();
+    const sendResult = await this.workspaceService.sendMessage(
+      workspaceId,
+      this.buildCompletionToolRecoveryMessage(completionToolName, options),
+      {
+        model,
+        agentId,
+        thinkingLevel: entry.workspace.taskThinkingLevel,
+        toolPolicy: [{ regex_match: `^${completionToolName}$`, action: "require" }],
+      },
+      { synthetic: true, agentInitiated: true }
+    );
+    const durationMs = Date.now() - startedAt;
+    if (!sendResult.success) {
+      log.error("Failed to prompt task for required completion tool", {
+        workspaceId,
+        taskName: entry.workspace.name,
+        projectPath: entry.projectPath,
+        completionToolName,
+        reason: options?.reason,
+        model,
+        agentId,
+        durationMs,
+        sendError: sendResult.error,
+        priorErrorType: options?.error?.errorType,
+        priorError: options?.error?.error,
+      });
+      return false;
+    }
+
+    log.info("Prompted task for required completion tool", {
+      workspaceId,
+      taskName: entry.workspace.name,
+      projectPath: entry.projectPath,
+      completionToolName,
+      reason: options?.reason,
+      model,
+      agentId,
+      durationMs,
+    });
+    return true;
+  }
+
   private async handleStreamEnd(event: StreamEndEvent): Promise<void> {
     const workspaceId = event.workspaceId;
 
@@ -3247,33 +3323,68 @@ export class TaskService {
       return;
     }
 
-    const missingCompletionToolName = isPlanLike ? "propose_plan" : "agent_report";
+    // Only infer an implicit report from a clean natural stop. Length-truncated or other
+    // provider finish reasons still go through explicit completion-tool recovery so partial
+    // assistant text cannot prematurely finalize the task.
+    if (!isPlanLike && status !== "awaiting_report" && event.metadata.finishReason === "stop") {
+      const implicitReportArgs = this.findImplicitAgentReportArgsInParts(event.parts);
+      if (implicitReportArgs) {
+        await this.finalizeAgentTaskReport(workspaceId, entry, implicitReportArgs);
+        await this.finalizeTerminationPhaseForReportedTask(workspaceId);
+        return;
+      }
+    }
 
-    // If a task stream ends without its required completion tool, request it once.
-    if (status === "awaiting_report" && this.remindedAwaitingReport.has(workspaceId)) {
-      await this.fallbackReportMissingCompletionTool(entry, missingCompletionToolName);
-      await this.finalizeTerminationPhaseForReportedTask(workspaceId);
+    if (status !== "awaiting_report") {
+      await this.setTaskStatus(workspaceId, "awaiting_report");
+    }
+
+    await this.promptTaskForRequiredCompletionTool(workspaceId, { reason: "stream_end" });
+  }
+
+  private async handleTaskStreamError(event: ErrorEvent): Promise<void> {
+    const workspaceId = event.workspaceId;
+    const cfg = this.config.loadConfigOrDefault();
+    const entry = findWorkspaceEntry(cfg, workspaceId);
+    if (!entry?.workspace.parentWorkspaceId) {
       return;
     }
 
-    await this.setTaskStatus(workspaceId, "awaiting_report");
+    if (entry.workspace.taskStatus !== "awaiting_report") {
+      return;
+    }
 
-    this.remindedAwaitingReport.add(workspaceId);
+    if (this.hasActiveDescendantAgentTasks(cfg, workspaceId)) {
+      return;
+    }
 
-    const model = entry.workspace.taskModelString ?? defaultModel;
-    await this.workspaceService.sendMessage(
-      workspaceId,
-      isPlanLike
-        ? "Your stream ended without calling propose_plan. Call propose_plan exactly once now."
-        : "Your stream ended without calling agent_report. Call agent_report exactly once now with your final report.",
+    if (event.errorType && isNonRetryableStreamError({ type: event.errorType })) {
+      log.error(
+        "Task awaiting required completion tool hit a non-retryable stream error; interrupting task",
+        {
+          workspaceId,
+          errorType: event.errorType,
+          error: event.error,
+        }
+      );
+      await this.setTaskStatus(workspaceId, "interrupted");
+      await this.settleInterruptedTaskAtStreamEnd(workspaceId, entry, null);
+      return;
+    }
+
+    log.warn(
+      "Task awaiting required completion tool hit a stream error; retrying report-only recovery",
       {
-        model,
-        agentId: entry.workspace.agentId ?? TASK_RECOVERY_FALLBACK_AGENT_ID,
-        thinkingLevel: entry.workspace.taskThinkingLevel,
-        toolPolicy: [{ regex_match: `^${missingCompletionToolName}$`, action: "require" }],
-      },
-      { synthetic: true, agentInitiated: true }
+        workspaceId,
+        errorType: event.errorType,
+        error: event.error,
+      }
     );
+
+    await this.promptTaskForRequiredCompletionTool(workspaceId, {
+      reason: "error",
+      error: event,
+    });
   }
 
   /**
@@ -3464,7 +3575,6 @@ export class TaskService {
       });
 
       await this.setTaskStatus(args.workspaceId, "running");
-      this.remindedAwaitingReport.delete(args.workspaceId);
 
       const kickoffMsg =
         targetAgentId === "orchestrator"
@@ -3812,73 +3922,6 @@ export class TaskService {
     }
   }
 
-  private async fallbackReportMissingCompletionTool(
-    entry: {
-      projectPath: string;
-      workspace: WorkspaceConfigEntry;
-    },
-    completionToolName: "agent_report" | "propose_plan"
-  ): Promise<void> {
-    const childWorkspaceId = entry.workspace.id;
-    if (!childWorkspaceId) {
-      return;
-    }
-
-    const agentType = entry.workspace.agentType ?? "agent";
-    const lastText = await this.readLatestAssistantText(childWorkspaceId);
-    const completionToolLabel =
-      completionToolName === "propose_plan" ? "`propose_plan`" : "`agent_report`";
-
-    const reportMarkdown =
-      `*(Note: this agent task did not call ${completionToolLabel}; posting its last assistant output as a fallback.)*\n\n` +
-      (lastText?.trim().length ? lastText : "(No assistant output found.)");
-
-    await this.finalizeAgentTaskReport(childWorkspaceId, entry, {
-      reportMarkdown,
-      title: `Subagent (${agentType}) report (fallback)`,
-    });
-  }
-
-  private async readLatestAssistantText(workspaceId: string): Promise<string | null> {
-    const partial = await this.historyService.readPartial(workspaceId);
-    if (partial && partial.role === "assistant") {
-      const text = this.concatTextParts(partial).trim();
-      if (text.length > 0) return text;
-    }
-
-    // Only need recent messages to find last assistant text — avoid full-file read.
-    // getLastMessages returns messages in chronological order.
-    const historyResult = await this.historyService.getLastMessages(workspaceId, 20);
-    if (!historyResult.success) {
-      log.error("Failed to read history for fallback report", {
-        workspaceId,
-        error: historyResult.error,
-      });
-      return null;
-    }
-
-    for (let i = historyResult.data.length - 1; i >= 0; i--) {
-      const msg = historyResult.data[i];
-      if (msg?.role !== "assistant") continue;
-      const text = this.concatTextParts(msg).trim();
-      if (text.length > 0) return text;
-    }
-
-    return null;
-  }
-
-  private concatTextParts(msg: MuxMessage): string {
-    let combined = "";
-    for (const part of msg.parts) {
-      if (!part || typeof part !== "object") continue;
-      const maybeText = part as { type?: unknown; text?: unknown };
-      if (maybeText.type !== "text") continue;
-      if (typeof maybeText.text !== "string") continue;
-      combined += maybeText.text;
-    }
-    return combined;
-  }
-
   private async finalizeAgentTaskReport(
     childWorkspaceId: string,
     childEntry: { projectPath: string; workspace: WorkspaceConfigEntry } | null | undefined,
@@ -4122,6 +4165,25 @@ export class TaskService {
       return { planPath };
     }
     return null;
+  }
+
+  private findImplicitAgentReportArgsInParts(
+    parts: readonly unknown[]
+  ): { reportMarkdown: string } | null {
+    let reportMarkdown = "";
+    for (const part of parts) {
+      if (!part || typeof part !== "object") continue;
+      const maybeText = part as { type?: unknown; text?: unknown };
+      if (maybeText.type !== "text" || typeof maybeText.text !== "string") continue;
+      reportMarkdown += maybeText.text;
+    }
+
+    const trimmedReport = reportMarkdown.trim();
+    if (trimmedReport.length === 0) {
+      return null;
+    }
+
+    return { reportMarkdown: trimmedReport };
   }
 
   private findAgentReportArgsInParts(

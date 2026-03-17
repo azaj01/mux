@@ -10,7 +10,10 @@ import {
   getSubagentGitPatchMboxPath,
   readSubagentGitPatchArtifact,
 } from "@/node/services/subagentGitPatchArtifacts";
-import { upsertSubagentReportArtifact } from "@/node/services/subagentReportArtifacts";
+import {
+  readSubagentReportArtifact,
+  upsertSubagentReportArtifact,
+} from "@/node/services/subagentReportArtifacts";
 import { TaskService, ForegroundWaitBackgroundedError } from "@/node/services/taskService";
 import type { WorkspaceForkParams } from "@/node/runtime/Runtime";
 import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
@@ -23,7 +26,7 @@ import { Ok, Err, type Result } from "@/common/types/result";
 import { defaultModel } from "@/common/utils/ai/models";
 import type { PlanSubagentExecutorRouting } from "@/common/types/tasks";
 import type { ThinkingLevel } from "@/common/types/thinking";
-import type { StreamEndEvent } from "@/common/types/stream";
+import type { ErrorEvent, StreamEndEvent } from "@/common/types/stream";
 import {
   PLAN_AUTO_ROUTING_STATUS_EMOJI,
   PLAN_AUTO_ROUTING_STATUS_MESSAGE,
@@ -5977,11 +5980,6 @@ describe("TaskService", () => {
       workspaceService,
     });
 
-    // Simulate the "second attempt" state (the task was already reminded).
-    (taskService as unknown as { remindedAwaitingReport: Set<string> }).remindedAwaitingReport.add(
-      childId
-    );
-
     const parentPartial = createMuxMessage(
       "assistant-parent-partial",
       "assistant",
@@ -6218,7 +6216,7 @@ describe("TaskService", () => {
     }
   });
 
-  test("missing agent_report triggers one reminder, then posts fallback output and cleans up", async () => {
+  test("non-plan subagent stream-end with final assistant text finalizes an implicit report", async () => {
     const config = await createTestConfig(rootDir);
 
     const projectPath = path.join(rootDir, "repo");
@@ -6254,8 +6252,8 @@ describe("TaskService", () => {
       await removeWorkspaceFromTestConfig(config, workspaceId);
       return Ok(undefined);
     });
-    const { workspaceService, sendMessage, emit } = createWorkspaceServiceMocks({ remove });
-    const { historyService, partialService, taskService } = createTaskServiceHarness(config, {
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({ remove });
+    const { partialService, taskService } = createTaskServiceHarness(config, {
       aiService,
       workspaceService,
     });
@@ -6278,15 +6276,6 @@ describe("TaskService", () => {
     const writeParentPartial = await partialService.writePartial(parentId, parentPartial);
     expect(writeParentPartial.success).toBe(true);
 
-    const assistantOutput = createMuxMessage(
-      "assistant-child-output",
-      "assistant",
-      "Final output without agent_report",
-      { timestamp: Date.now() }
-    );
-    const appendChildHistory = await historyService.appendToHistory(childId, assistantOutput);
-    expect(appendChildHistory.success).toBe(true);
-
     const internal = taskService as unknown as {
       handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
     };
@@ -6295,36 +6284,9 @@ describe("TaskService", () => {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child-output",
-      metadata: { model: "openai:gpt-4o-mini" },
-      parts: [],
+      metadata: { model: "openai:gpt-4o-mini", finishReason: "stop" },
+      parts: [{ type: "text", text: "## Final answer\n\nImplicit report content from the child." }],
     });
-    expect(sendMessage).toHaveBeenCalled();
-
-    const midCfg = config.loadConfigOrDefault();
-    const midWs = Array.from(midCfg.projects.values())
-      .flatMap((p) => p.workspaces)
-      .find((w) => w.id === childId);
-    expect(midWs?.taskStatus).toBe("awaiting_report");
-
-    await internal.handleStreamEnd({
-      type: "stream-end",
-      workspaceId: childId,
-      messageId: "assistant-child-output",
-      metadata: { model: "openai:gpt-4o-mini" },
-      parts: [],
-    });
-
-    const emitCalls = (emit as unknown as { mock: { calls: Array<[string, unknown]> } }).mock.calls;
-    const metadataEmitsForChild = emitCalls.filter((call) => {
-      const [eventName, payload] = call;
-      if (eventName !== "metadata") return false;
-      if (!payload || typeof payload !== "object") return false;
-      const maybePayload = payload as { workspaceId?: unknown };
-      return maybePayload.workspaceId === childId;
-    });
-    expect(metadataEmitsForChild).toHaveLength(2);
-
-    await collectFullHistory(historyService, parentId);
 
     const updatedParentPartial = await partialService.readPartial(parentId);
     expect(updatedParentPartial).not.toBeNull();
@@ -6344,9 +6306,16 @@ describe("TaskService", () => {
         | undefined;
       expect(toolPart?.toolName).toBe("task");
       expect(toolPart?.state).toBe("output-available");
-      expect(JSON.stringify(toolPart?.output)).toContain("Final output without agent_report");
-      expect(JSON.stringify(toolPart?.output)).toContain("fallback");
+      const outputJson = JSON.stringify(toolPart?.output);
+      expect(outputJson).toContain("Implicit report content from the child.");
+      expect(outputJson).not.toContain("fallback");
     }
+
+    const report = await readSubagentReportArtifact(config.getSessionDir(parentId), childId);
+    expect(report?.reportMarkdown).toBe(
+      "## Final answer\n\nImplicit report content from the child."
+    );
+    expect(report?.title).toBeUndefined();
 
     const postCfg = config.loadConfigOrDefault();
     const ws = Array.from(postCfg.projects.values())
@@ -6356,13 +6325,210 @@ describe("TaskService", () => {
 
     expect(remove).toHaveBeenCalledTimes(1);
     expect(remove).toHaveBeenCalledWith(childId, true);
-    // Parent auto-resume now uses sendMessage instead of resumeStream
+    const sendCalls = (sendMessage as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+    for (const call of sendCalls) {
+      const msg = call[1] as string;
+      expect(msg).not.toContain("agent_report");
+    }
+  });
+
+  test("length-truncated final assistant text still requires explicit agent_report", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const parentId = "parent-111";
+    const childId = "child-222";
+
+    await config.saveConfig({
+      projects: new Map([
+        [
+          projectPath,
+          {
+            trusted: true,
+            workspaces: [
+              { path: path.join(projectPath, "parent"), id: parentId, name: "parent" },
+              {
+                path: path.join(projectPath, "child"),
+                id: childId,
+                name: "agent_explore_child",
+                parentWorkspaceId: parentId,
+                agentType: "explore",
+                taskStatus: "running",
+                taskModelString: "openai:gpt-4o-mini",
+              },
+            ],
+          },
+        ],
+      ]),
+      taskSettings: { maxParallelAgentTasks: 3, maxTaskNestingDepth: 3 },
+    });
+
+    const { aiService } = createAIServiceMocks(config);
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, {
+      aiService,
+      workspaceService,
+    });
+
+    const internal = taskService as unknown as {
+      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
+    };
+
+    await internal.handleStreamEnd({
+      type: "stream-end",
+      workspaceId: childId,
+      messageId: "assistant-child-output",
+      metadata: { model: "openai:gpt-4o-mini", finishReason: "length" },
+      parts: [{ type: "text", text: "Partial final-looking text that was cut off" }],
+    });
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(sendMessage).toHaveBeenCalledWith(
-      parentId,
-      expect.stringContaining("sub-agent task(s) have completed"),
-      expect.any(Object),
-      expect.objectContaining({ skipAutoResumeReset: true, synthetic: true })
+      childId,
+      expect.stringContaining("Your stream ended without calling agent_report"),
+      expect.objectContaining({
+        toolPolicy: [{ regex_match: "^agent_report$", action: "require" }],
+      }),
+      expect.objectContaining({ synthetic: true, agentInitiated: true })
     );
+
+    const postCfg = config.loadConfigOrDefault();
+    const ws = Array.from(postCfg.projects.values())
+      .flatMap((p) => p.workspaces)
+      .find((w) => w.id === childId);
+    expect(ws?.taskStatus).toBe("awaiting_report");
+  });
+
+  test("missing agent_report keeps the task awaiting_report and retries with agent_report-only prompts", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const parentId = "parent-111";
+    const childId = "child-222";
+
+    await config.saveConfig({
+      projects: new Map([
+        [
+          projectPath,
+          {
+            trusted: true,
+            workspaces: [
+              { path: path.join(projectPath, "parent"), id: parentId, name: "parent" },
+              {
+                path: path.join(projectPath, "child"),
+                id: childId,
+                name: "agent_explore_child",
+                parentWorkspaceId: parentId,
+                agentType: "explore",
+                taskStatus: "running",
+                taskModelString: "openai:gpt-4o-mini",
+              },
+            ],
+          },
+        ],
+      ]),
+      taskSettings: { maxParallelAgentTasks: 3, maxTaskNestingDepth: 3 },
+    });
+
+    const { aiService } = createAIServiceMocks(config);
+    const remove = mock(async (workspaceId: string, _force?: boolean): Promise<Result<void>> => {
+      await removeWorkspaceFromTestConfig(config, workspaceId);
+      return Ok(undefined);
+    });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({ remove });
+    const { partialService, taskService } = createTaskServiceHarness(config, {
+      aiService,
+      workspaceService,
+    });
+
+    const parentPartial = createMuxMessage(
+      "assistant-parent-partial",
+      "assistant",
+      "Waiting on subagent…",
+      { timestamp: Date.now() },
+      [
+        {
+          type: "dynamic-tool",
+          toolCallId: "task-call-1",
+          toolName: "task",
+          input: { subagent_type: "explore", prompt: "do the thing", title: "Test task" },
+          state: "input-available",
+        },
+      ]
+    );
+    const writeParentPartial = await partialService.writePartial(parentId, parentPartial);
+    expect(writeParentPartial.success).toBe(true);
+
+    const internal = taskService as unknown as {
+      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
+    };
+
+    await internal.handleStreamEnd({
+      type: "stream-end",
+      workspaceId: childId,
+      messageId: "assistant-child-output",
+      metadata: { model: "openai:gpt-4o-mini" },
+      parts: [],
+    });
+
+    await internal.handleStreamEnd({
+      type: "stream-end",
+      workspaceId: childId,
+      messageId: "assistant-child-output",
+      metadata: { model: "openai:gpt-4o-mini" },
+      parts: [],
+    });
+
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+    expect(sendMessage).toHaveBeenNthCalledWith(
+      1,
+      childId,
+      expect.stringContaining("Your stream ended without calling agent_report"),
+      expect.objectContaining({
+        toolPolicy: [{ regex_match: "^agent_report$", action: "require" }],
+      }),
+      expect.objectContaining({ synthetic: true, agentInitiated: true })
+    );
+    expect(sendMessage).toHaveBeenNthCalledWith(
+      2,
+      childId,
+      expect.stringContaining("Do not continue investigating or call other tools"),
+      expect.objectContaining({
+        toolPolicy: [{ regex_match: "^agent_report$", action: "require" }],
+      }),
+      expect.objectContaining({ synthetic: true, agentInitiated: true })
+    );
+
+    const postCfg = config.loadConfigOrDefault();
+    const ws = Array.from(postCfg.projects.values())
+      .flatMap((p) => p.workspaces)
+      .find((w) => w.id === childId);
+    expect(ws?.taskStatus).toBe("awaiting_report");
+
+    const updatedParentPartial = await partialService.readPartial(parentId);
+    expect(updatedParentPartial).not.toBeNull();
+    if (updatedParentPartial) {
+      const toolPart = updatedParentPartial.parts.find(
+        (p) =>
+          p &&
+          typeof p === "object" &&
+          "type" in p &&
+          (p as { type?: unknown }).type === "dynamic-tool"
+      ) as unknown as
+        | {
+            toolName: string;
+            state: string;
+            output?: unknown;
+          }
+        | undefined;
+      expect(toolPart?.toolName).toBe("task");
+      expect(toolPart?.state).toBe("input-available");
+      expect(toolPart?.output).toBeUndefined();
+    }
+
+    const report = await readSubagentReportArtifact(config.getSessionDir(parentId), childId);
+    expect(report).toBeNull();
+    expect(remove).not.toHaveBeenCalled();
   });
 
   test("parent stream-end rechecks cleanup for reported best-of children", async () => {
@@ -7591,6 +7757,30 @@ describe("TaskService", () => {
     expect(updatedTask?.taskStatus).toBe("running");
   });
 
+  test("plan task stream-end with final assistant text still requires propose_plan", async () => {
+    const { config, childId, sendMessage, internal } = await setupPlanModeStreamEndHarness();
+
+    await internal.handleStreamEnd({
+      type: "stream-end",
+      workspaceId: childId,
+      messageId: "assistant-plan-output",
+      metadata: { model: "openai:gpt-4o-mini", finishReason: "stop" },
+      parts: [{ type: "text", text: "Here is the final plan in prose, but no propose_plan call." }],
+    });
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    const reminderMessage = (sendMessage as unknown as { mock: { calls: Array<[string, string]> } })
+      .mock.calls[0]?.[1];
+    expect(reminderMessage).toContain("propose_plan");
+    expect(reminderMessage).not.toContain("agent_report");
+
+    const postCfg = config.loadConfigOrDefault();
+    const updatedTask = Array.from(postCfg.projects.values())
+      .flatMap((project) => project.workspaces)
+      .find((workspace) => workspace.id === childId);
+    expect(updatedTask?.taskStatus).toBe("awaiting_report");
+  });
+
   test("plan task stream-end without propose_plan sends propose_plan reminder (not agent_report)", async () => {
     const { config, childId, sendMessage, internal } = await setupPlanModeStreamEndHarness();
 
@@ -7614,6 +7804,168 @@ describe("TaskService", () => {
       .flatMap((project) => project.workspaces)
       .find((workspace) => workspace.id === childId);
     expect(updatedTask?.taskStatus).toBe("awaiting_report");
+  });
+
+  test("awaiting_report tasks keep retrying agent_report after recovery errors instead of fabricating fallback reports", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const parentId = "parent-111";
+    const childId = "child-222";
+
+    await config.saveConfig({
+      projects: new Map([
+        [
+          projectPath,
+          {
+            trusted: true,
+            workspaces: [
+              { path: path.join(projectPath, "parent"), id: parentId, name: "parent" },
+              {
+                path: path.join(projectPath, "child"),
+                id: childId,
+                name: "agent_explore_child",
+                parentWorkspaceId: parentId,
+                agentType: "explore",
+                taskStatus: "running",
+                taskModelString: "openai:gpt-5.4-pro",
+              },
+            ],
+          },
+        ],
+      ]),
+      taskSettings: { maxParallelAgentTasks: 1, maxTaskNestingDepth: 3 },
+    });
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const internal = taskService as unknown as {
+      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
+      handleTaskStreamError: (event: ErrorEvent) => Promise<void>;
+    };
+
+    await internal.handleStreamEnd({
+      type: "stream-end",
+      workspaceId: childId,
+      messageId: "assistant-child",
+      metadata: { model: "openai:gpt-5.4-pro" },
+      parts: [],
+    });
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await internal.handleTaskStreamError({
+        type: "error",
+        workspaceId: childId,
+        messageId: `assistant-error-${attempt}`,
+        error: "The model ended the stream before producing any assistant-visible output.",
+        errorType: "empty_output",
+      });
+    }
+
+    expect(sendMessage).toHaveBeenCalledTimes(4);
+    expect(sendMessage).toHaveBeenNthCalledWith(
+      1,
+      childId,
+      expect.stringContaining("Your stream ended without calling agent_report"),
+      expect.objectContaining({
+        toolPolicy: [{ regex_match: "^agent_report$", action: "require" }],
+      }),
+      expect.objectContaining({ synthetic: true, agentInitiated: true })
+    );
+    expect(sendMessage).toHaveBeenNthCalledWith(
+      2,
+      childId,
+      expect.stringContaining(
+        "The previous agent_report attempt failed (last error: empty_output)"
+      ),
+      expect.objectContaining({
+        toolPolicy: [{ regex_match: "^agent_report$", action: "require" }],
+      }),
+      expect.objectContaining({ synthetic: true, agentInitiated: true })
+    );
+
+    const report = await readSubagentReportArtifact(config.getSessionDir(parentId), childId);
+    expect(report).toBeNull();
+
+    const postCfg = config.loadConfigOrDefault();
+    const childWorkspace = Array.from(postCfg.projects.values())
+      .flatMap((project) => project.workspaces)
+      .find((workspace) => workspace.id === childId);
+    expect(childWorkspace?.taskStatus).toBe("awaiting_report");
+  });
+
+  test("awaiting_report tasks interrupt instead of retrying forever after non-retryable errors", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const parentId = "parent-111";
+    const childId = "child-222";
+
+    await config.saveConfig({
+      projects: new Map([
+        [
+          projectPath,
+          {
+            trusted: true,
+            workspaces: [
+              { path: path.join(projectPath, "parent"), id: parentId, name: "parent" },
+              {
+                path: path.join(projectPath, "child"),
+                id: childId,
+                name: "agent_explore_child",
+                parentWorkspaceId: parentId,
+                agentType: "explore",
+                taskStatus: "running",
+                taskModelString: "openai:gpt-5.4-pro",
+              },
+            ],
+          },
+        ],
+      ]),
+      taskSettings: { maxParallelAgentTasks: 1, maxTaskNestingDepth: 3 },
+    });
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const internal = taskService as unknown as {
+      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
+      handleTaskStreamError: (event: ErrorEvent) => Promise<void>;
+    };
+
+    await internal.handleStreamEnd({
+      type: "stream-end",
+      workspaceId: childId,
+      messageId: "assistant-child",
+      metadata: { model: "openai:gpt-5.4-pro" },
+      parts: [],
+    });
+
+    await internal.handleTaskStreamError({
+      type: "error",
+      workspaceId: childId,
+      messageId: "assistant-error-auth",
+      error: "Authentication failed",
+      errorType: "authentication",
+    });
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenNthCalledWith(
+      1,
+      childId,
+      expect.stringContaining("Your stream ended without calling agent_report"),
+      expect.objectContaining({
+        toolPolicy: [{ regex_match: "^agent_report$", action: "require" }],
+      }),
+      expect.objectContaining({ synthetic: true, agentInitiated: true })
+    );
+
+    const postCfg = config.loadConfigOrDefault();
+    const childWorkspace = Array.from(postCfg.projects.values())
+      .flatMap((project) => project.workspaces)
+      .find((workspace) => workspace.id === childId);
+    expect(childWorkspace?.taskStatus).toBe("interrupted");
   });
 
   test("stream-end with propose_plan success in auto routing falls back to exec when plan content is unavailable", async () => {
