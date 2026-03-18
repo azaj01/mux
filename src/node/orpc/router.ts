@@ -78,6 +78,7 @@ import type { MuxMessage } from "@/common/types/message";
 import { coerceThinkingLevel } from "@/common/types/thinking";
 import { normalizeLegacyMuxMetadata } from "@/node/utils/messages/legacy";
 import { log } from "@/node/services/log";
+import { DESKTOP_WS_PATH } from "@/node/orpc/wsPaths";
 import { SERVER_AUTH_SESSION_COOKIE_NAME } from "@/node/services/serverAuthService";
 import {
   readSubagentTranscriptArtifactsFile,
@@ -4436,16 +4437,19 @@ export const router = (authToken?: string) => {
             return { capability };
           }
 
+          const serverInfo = context.serverService.getServerInfo();
+          if (serverInfo == null) {
+            log.error("Desktop bootstrap failed: API server unavailable", {
+              workspaceId: input.workspaceId,
+            });
+            return {
+              capability: { available: false as const, reason: "startup_failed" as const },
+            };
+          }
+
           try {
             const session = await context.desktopSessionManager.ensureStarted(input.workspaceId);
             const sessionInfo = session.getSessionInfo();
-            // Reuse the API server bind host so browser clients can reach the desktop bridge over
-            // the same interface they used for the main backend instead of a loopback-only socket.
-            const bridgeBindHost =
-              context.serverService.getServerInfo()?.bindHost ??
-              context.config.loadConfigOrDefault().apiServerBindHost ??
-              "127.0.0.1";
-            const bridgePort = await context.desktopBridgeServer.start(bridgeBindHost);
             const startedCapability = {
               available: true as const,
               width: sessionInfo.width,
@@ -4456,7 +4460,12 @@ export const router = (authToken?: string) => {
               input.workspaceId,
               startedCapability.sessionId
             );
-            return { capability: startedCapability, bridgePort, token };
+            return {
+              capability: startedCapability,
+              bridgePath: DESKTOP_WS_PATH,
+              token,
+              localBridgeBaseUrl: serverInfo.baseUrl,
+            };
           } catch (error) {
             log.error("Desktop bootstrap failed", {
               workspaceId: input.workspaceId,

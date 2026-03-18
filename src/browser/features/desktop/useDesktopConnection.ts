@@ -42,45 +42,62 @@ function assertDesktop(condition: unknown, message: string): asserts condition {
   }
 }
 
-function getDesktopBridgeBaseUrl(): URL {
-  if (typeof window !== "undefined") {
-    try {
-      // User rationale: the desktop bridge reuses the backend bind host, so the renderer should
-      // derive the bridge host from the same backend origin instead of assuming loopback.
-      const backendBaseUrl = new URL(getBrowserBackendBaseUrl());
-      if (backendBaseUrl.hostname.length > 0) {
-        return backendBaseUrl;
-      }
-    } catch {
-      // Fall through to window.location-derived fallbacks below.
-    }
-
-    if (window.location.hostname.length > 0) {
-      return new URL(`http://${window.location.hostname}`);
-    }
-
-    if (window.location.protocol === "http:" || window.location.protocol === "https:") {
-      return new URL(window.location.origin);
-    }
+/**
+ * Derive the base URL for the Desktop WebSocket bridge.
+ *
+ * In browser mode, getBrowserBackendBaseUrl() works correctly (respects
+ * VITE_BACKEND_URL, app-proxy paths, and window.location.origin).
+ *
+ * In packaged Electron, window.location.origin may be "file://" or
+ * "null", so we fall back to a localhost URL. The backend port in
+ * Electron is available through window.api (the preload bridge).
+ */
+function getDesktopBridgeBaseUrl(): string {
+  const backendUrl = getBrowserBackendBaseUrl();
+  // getBrowserBackendBaseUrl checks VITE_BACKEND_URL first, which is
+  // set in dev mode. In production browser mode it uses window.location.origin.
+  // Both are valid — only packaged Electron (file:// origin) needs a fallback.
+  if (!backendUrl || backendUrl === "null" || backendUrl.startsWith("file:")) {
+    return "http://localhost";
   }
 
-  return new URL("http://localhost");
+  try {
+    const origin = new URL(backendUrl).origin;
+    if (origin && origin !== "null") {
+      return backendUrl;
+    }
+  } catch {
+    // Packaged Electron can surface opaque or otherwise non-URL backend base strings.
+    // Fall back to localhost so the desktop bridge still connects through the preload backend.
+  }
+
+  // Electron fallback: use localhost. In Electron, the backend URL is
+  // provided via the preload bridge at window.api.
+  return "http://localhost";
 }
 
-function buildDesktopBridgeUrl(bridgePort: number, token: string): string {
-  assertDesktop(
-    Number.isInteger(bridgePort) && bridgePort > 0,
-    "Desktop bootstrap response is missing a valid bridgePort."
-  );
+function buildDesktopBridgeUrl(
+  bridgePath: string,
+  token: string,
+  localBridgeBaseUrl?: string
+): string {
+  assertDesktop(bridgePath.length > 0, "Desktop bootstrap response is missing a valid bridgePath.");
   assertDesktop(token.length > 0, "Desktop bootstrap response is missing a valid token.");
 
-  const wsUrl = new URL(getDesktopBridgeBaseUrl().origin);
+  const isDesktop = typeof window.api !== "undefined";
+  const baseUrl =
+    isDesktop && typeof localBridgeBaseUrl === "string" && localBridgeBaseUrl.length > 0
+      ? localBridgeBaseUrl
+      : getDesktopBridgeBaseUrl();
+  // Concatenate base + bridgePath to preserve any app-proxy prefix
+  // (e.g. /@user/ws/apps/mux + /desktop/ws → /@user/ws/apps/mux/desktop/ws)
+  const fullUrl = baseUrl.endsWith("/")
+    ? baseUrl + bridgePath.replace(/^\//, "")
+    : baseUrl + bridgePath;
+  const wsUrl = new URL(fullUrl);
   // Derive ws/wss from page protocol — in HTTPS deployments, a reverse proxy handles TLS
   // termination for the bridge.
   wsUrl.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  wsUrl.port = String(bridgePort);
-  wsUrl.pathname = "/";
-  wsUrl.search = "";
   wsUrl.searchParams.set("token", token);
   return wsUrl.toString();
 }
@@ -201,17 +218,17 @@ export function useDesktopConnection(workspaceId: string): UseDesktopConnectionR
           return;
         }
 
-        const bridgePort = result.bridgePort;
+        const bridgePath = result.bridgePath;
         assertDesktop(
-          bridgePort != null,
-          "Desktop bootstrap response is missing a valid bridgePort."
+          typeof bridgePath === "string" && bridgePath.length > 0,
+          "Desktop bootstrap response is missing a valid bridgePath."
         );
         const token = result.token;
         assertDesktop(
           typeof token === "string" && token.length > 0,
           "Desktop bootstrap response is missing a valid token."
         );
-        const wsUrl = buildDesktopBridgeUrl(bridgePort, token);
+        const wsUrl = buildDesktopBridgeUrl(bridgePath, token, result.localBridgeBaseUrl);
         setWidth(result.capability.width);
         setHeight(result.capability.height);
 

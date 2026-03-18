@@ -1,6 +1,6 @@
-import * as http from "node:http";
 import * as net from "node:net";
 import type { IncomingMessage } from "node:http";
+import type { Duplex } from "node:stream";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
 import { assert } from "@/common/utils/assert";
 import { log } from "@/node/services/log";
@@ -22,14 +22,6 @@ interface BridgePair {
 export interface DesktopBridgeServerOptions {
   desktopSessionManager: Pick<DesktopSessionManager, "getLiveSessionConnection">;
   desktopTokenManager: Pick<DesktopTokenManager, "validate">;
-  host?: string;
-}
-
-function normalizeListenHost(host: string | undefined): string {
-  const trimmedHost = host?.trim();
-  const normalizedHost = trimmedHost && trimmedHost.length > 0 ? trimmedHost : "127.0.0.1";
-  assert(normalizedHost.length > 0, "DesktopBridgeServer requires a non-empty listen host");
-  return normalizedHost;
 }
 
 function normalizeBinaryMessage(data: RawData): Buffer {
@@ -59,19 +51,17 @@ function closeWebSocket(ws: WebSocket, code: number, reason: string): void {
   }
 }
 
-function closeHttpServer(server: http.Server): void {
+function rejectUpgrade(socket: Duplex): void {
   try {
-    server.close();
+    socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
   } catch (error) {
-    log.debug("DesktopBridgeServer: HTTP server close failed", { error });
+    log.debug("DesktopBridgeServer: failed to write upgrade rejection response", { error });
   }
-}
 
-function closeWebSocketServer(server: WebSocketServer): void {
   try {
-    server.close();
+    socket.destroy();
   } catch (error) {
-    log.debug("DesktopBridgeServer: WebSocketServer close failed", { error });
+    log.debug("DesktopBridgeServer: failed to destroy rejected upgrade socket", { error });
   }
 }
 
@@ -102,136 +92,51 @@ async function waitForWebSocketClose(ws: WebSocket, timeoutMs = 250): Promise<vo
 }
 
 export class DesktopBridgeServer {
-  private host: string;
   private readonly desktopSessionManager: Pick<DesktopSessionManager, "getLiveSessionConnection">;
   private readonly desktopTokenManager: Pick<DesktopTokenManager, "validate">;
-  private httpServer: http.Server | null = null;
-  private wss: WebSocketServer | null = null;
-  private port: number | null = null;
-  private startPromise: Promise<number> | null = null;
-  private stopPromise: Promise<void> | null = null;
+  private readonly wss: WebSocketServer;
   private readonly activePairs = new Set<BridgePair>();
-  private readonly httpSockets = new Set<net.Socket>();
+  // Keep upgrade rejection aligned with stop() so httpServer.close() cannot hang on sockets
+  // that reconnect after shutdown snapshots the current bridge clients.
+  private isStopping = false;
+  private stopPromise: Promise<void> | null = null;
 
   constructor(options: DesktopBridgeServerOptions) {
     assert(options.desktopSessionManager, "DesktopBridgeServer requires a DesktopSessionManager");
     assert(options.desktopTokenManager, "DesktopBridgeServer requires a DesktopTokenManager");
 
-    this.host = normalizeListenHost(options.host);
     this.desktopSessionManager = options.desktopSessionManager;
     this.desktopTokenManager = options.desktopTokenManager;
+    this.wss = new WebSocketServer({ noServer: true });
   }
 
-  async start(host?: string): Promise<number> {
-    const requestedHost = normalizeListenHost(host ?? this.host);
-    if (this.port !== null) {
-      if (requestedHost === this.host) {
-        return this.port;
-      }
-      await this.stop();
-    }
-
-    if (this.startPromise) {
-      if (requestedHost === this.host) {
-        return this.startPromise;
-      }
-      await this.startPromise;
-      return this.start(requestedHost);
-    }
-
-    if (this.stopPromise) {
-      await this.stopPromise;
-    }
-
-    this.host = requestedHost;
-    this.startPromise = (async () => {
-      const listenHost = this.host;
-      const httpServer = http.createServer();
-      const wss = new WebSocketServer({ noServer: true });
-
-      httpServer.on("connection", (socket) => {
-        this.httpSockets.add(socket);
-        socket.once("close", () => {
-          this.httpSockets.delete(socket);
-        });
-      });
-
-      httpServer.on("upgrade", (request, socket, head) => {
-        wss.handleUpgrade(request, socket, head, (ws) => {
-          void this.handleUpgradedConnection(ws, request);
-        });
-      });
-
-      httpServer.on("clientError", (_error, socket) => {
-        socket.destroy();
-      });
-
-      try {
-        await new Promise<void>((resolve, reject) => {
-          const onError = (error: Error) => {
-            httpServer.off("error", onError);
-            reject(error);
-          };
-
-          httpServer.once("error", onError);
-          httpServer.listen(0, listenHost, () => {
-            httpServer.off("error", onError);
-            resolve();
-          });
-        });
-
-        const address = httpServer.address();
-        assert(
-          address !== null && typeof address === "object",
-          "DesktopBridgeServer address must exist"
-        );
-        assert(Number.isInteger(address.port), "DesktopBridgeServer port must be an integer");
-        assert(address.port > 0, "DesktopBridgeServer port must be positive");
-
-        this.httpServer = httpServer;
-        this.wss = wss;
-        this.port = address.port;
-
-        log.debug("DesktopBridgeServer: started", { host: this.host, port: this.port });
-        return address.port;
-      } catch (error) {
-        closeWebSocketServer(wss);
-        closeHttpServer(httpServer);
-        throw error;
-      }
-    })();
-
-    try {
-      return await this.startPromise;
-    } finally {
-      this.startPromise = null;
-    }
+  public ensureReady(): void {
+    assert(this.wss, "DesktopBridgeServer WebSocketServer must be initialized");
   }
 
-  async stop(): Promise<void> {
-    const hasStateToClose =
-      this.httpServer !== null ||
-      this.wss !== null ||
-      this.startPromise !== null ||
-      this.activePairs.size > 0;
-    if (!hasStateToClose) {
+  public handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
+    this.ensureReady();
+    if (this.isStopping) {
+      log.debug("DesktopBridgeServer: rejecting upgrade while stopping", { url: request.url });
+      rejectUpgrade(socket);
       return;
     }
 
+    this.wss.handleUpgrade(request, socket, head, (ws) => {
+      void this.handleUpgradedConnection(ws, request);
+    });
+  }
+
+  async stop(): Promise<void> {
     if (this.stopPromise) {
-      return this.stopPromise;
+      await this.stopPromise;
+      return;
     }
 
-    this.stopPromise = (async () => {
-      const pendingStart = this.startPromise;
-      if (pendingStart) {
-        await pendingStart.catch(() => undefined);
-      }
-
-      const wss = this.wss;
-      const httpServer = this.httpServer;
+    this.isStopping = true;
+    const stopPromise = (async () => {
       const activePairs = Array.from(this.activePairs);
-      const activeWebSockets = new Set(activePairs.map((pair) => pair.ws));
+      const trackedWebSockets = new Set(activePairs.map((pair) => pair.ws));
       const activePairClosePromises = activePairs.map((pair) => waitForWebSocketClose(pair.ws));
 
       for (const pair of activePairs) {
@@ -242,53 +147,39 @@ export class DesktopBridgeServer {
       }
       await Promise.allSettled(activePairClosePromises);
 
-      if (wss) {
-        for (const ws of wss.clients) {
-          if (activeWebSockets.has(ws)) {
-            continue;
-          }
+      const orphanClientClosePromises: Array<Promise<void>> = [];
+      for (const ws of this.wss.clients) {
+        if (trackedWebSockets.has(ws)) {
+          continue;
+        }
 
-          try {
-            if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-              ws.close();
-            } else if (ws.readyState !== WebSocket.CLOSED) {
-              ws.terminate();
-            }
-          } catch (error) {
-            log.debug("DesktopBridgeServer: failed to close tracked WebSocket during shutdown", {
-              error,
-            });
-          }
+        orphanClientClosePromises.push(waitForWebSocketClose(ws));
+        closeWebSocket(ws, SERVER_STOPPING_CLOSE_CODE, "server stopping");
+      }
+      await Promise.allSettled(orphanClientClosePromises);
+
+      for (const ws of this.wss.clients) {
+        if (ws.readyState !== WebSocket.CLOSED) {
+          ws.terminate();
         }
       }
 
-      this.httpSockets.clear();
+      this.activePairs.clear();
 
-      this.wss = null;
-      this.httpServer = null;
-      this.port = null;
-
-      if (wss) {
-        closeWebSocketServer(wss);
+      if (activePairs.length > 0 || orphanClientClosePromises.length > 0) {
+        log.debug("DesktopBridgeServer: stopped", {
+          activePairs: activePairs.length,
+          orphanClients: orphanClientClosePromises.length,
+        });
       }
-      if (httpServer) {
-        closeHttpServer(httpServer);
-      }
-
-      log.debug("DesktopBridgeServer: stopped");
     })();
+    this.stopPromise = stopPromise;
 
     try {
-      await this.stopPromise;
-    } catch (error) {
-      log.error("DesktopBridgeServer: stop failed", { error });
+      await stopPromise;
     } finally {
-      this.startPromise = null;
       this.stopPromise = null;
-      this.wss = null;
-      this.httpServer = null;
-      this.port = null;
-      this.httpSockets.clear();
+      this.isStopping = false;
     }
   }
 
