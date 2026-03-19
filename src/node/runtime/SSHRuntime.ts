@@ -55,6 +55,13 @@ const BASE_REPO_DIR = ".mux-base.git";
  *  of refs/heads/* so they don't collide with branches checked out in worktrees. */
 const BUNDLE_REF_PREFIX = "refs/mux-bundle/";
 
+/** Small backoff for concurrent writers healing the same shared base repo config. */
+const BASE_REPO_CONFIG_LOCK_RETRY_DELAYS_MS = [50, 100, 200];
+
+function isGitConfigLockConflict(message: string): boolean {
+  return /could not lock config file/i.test(message);
+}
+
 function logSSHBackoffWait(initLogger: InitLogger, waitMs: number): void {
   const secs = Math.max(1, Math.ceil(waitMs / 1000));
   initLogger.logStep(`SSH unavailable; retrying in ${secs}s...`);
@@ -385,7 +392,81 @@ export class SSHRuntime extends RemoteRuntime {
       }
     }
 
+    const normalizedConfig = await this.normalizeBaseRepoSharedConfig(baseRepoPathArg, abortSignal);
+    if (normalizedConfig) {
+      initLogger.logStep("Normalized shared base repository config for worktrees");
+    }
+
     return baseRepoPathArg;
+  }
+
+  /**
+   * Keep the shared SSH base repo bare by layout instead of by sharing `core.bare`
+   * through the repo's common config. Linked worktrees consult that local config too,
+   * so leaving `core.bare=true` there leaks bare-repo metadata into normal workspace
+   * checkouts even though Git can infer the host repo is bare from its directory
+   * layout alone.
+   */
+  private async normalizeBaseRepoSharedConfig(
+    baseRepoPathArg: string,
+    abortSignal?: AbortSignal
+  ): Promise<boolean> {
+    for (let attempt = 0; attempt <= BASE_REPO_CONFIG_LOCK_RETRY_DELAYS_MS.length; attempt++) {
+      const unsetResult = await execBuffered(
+        this,
+        `git -C ${baseRepoPathArg} config --local --unset-all core.bare`,
+        {
+          cwd: "/tmp",
+          timeout: 10,
+          abortSignal,
+        }
+      );
+
+      if (unsetResult.exitCode === 0) {
+        return true;
+      }
+
+      if (unsetResult.exitCode === 5) {
+        return false;
+      }
+
+      const errorDetail = unsetResult.stderr || unsetResult.stdout;
+      if (!isGitConfigLockConflict(errorDetail)) {
+        throw new Error(`Failed to normalize base repo config: ${errorDetail}`);
+      }
+
+      const inspectResult = await execBuffered(
+        this,
+        `git -C ${baseRepoPathArg} config --local --get core.bare`,
+        {
+          cwd: "/tmp",
+          timeout: 10,
+          abortSignal,
+        }
+      );
+
+      if (inspectResult.exitCode === 1) {
+        return false;
+      }
+
+      if (inspectResult.exitCode !== 0) {
+        throw new Error(
+          `Failed to inspect base repo config after lock conflict: ${inspectResult.stderr || inspectResult.stdout}`
+        );
+      }
+
+      if (attempt === BASE_REPO_CONFIG_LOCK_RETRY_DELAYS_MS.length) {
+        throw new Error(`Failed to normalize base repo config: ${errorDetail}`);
+      }
+
+      // Another initWorkspace may be healing the same shared base repo; if the
+      // local key still exists, wait briefly and retry the idempotent unset.
+      await new Promise((resolve) =>
+        setTimeout(resolve, BASE_REPO_CONFIG_LOCK_RETRY_DELAYS_MS[attempt])
+      );
+    }
+
+    return false;
   }
 
   /**
@@ -555,6 +636,57 @@ export class SSHRuntime extends RemoteRuntime {
         };
       }
 
+      return {
+        ready: false,
+        error: WORKSPACE_REPO_MISSING_ERROR,
+        errorType: "runtime_not_ready",
+      };
+    }
+
+    let worktreeResult: { exitCode: number; stderr: string; stdout: string };
+    try {
+      worktreeResult = await execBuffered(
+        this,
+        `git -C ${this.quoteForRemote(workspacePath)} rev-parse --is-inside-work-tree`,
+        {
+          cwd: "~",
+          timeout: 10,
+          abortSignal: options?.signal,
+        }
+      );
+    } catch (error) {
+      return {
+        ready: false,
+        error: `Failed to verify worktree: ${getErrorMessage(error)}`,
+        errorType: "runtime_start_failed",
+      };
+    }
+
+    if (worktreeResult.exitCode !== 0) {
+      const stderr = worktreeResult.stderr.trim();
+      const stdout = worktreeResult.stdout.trim();
+      const errorDetail = stderr || stdout || "git unavailable";
+      const isCommandMissing =
+        worktreeResult.exitCode === 127 || /command not found/i.test(stderr || stdout);
+      if (
+        isCommandMissing ||
+        this.transport.isConnectionFailure(worktreeResult.exitCode, worktreeResult.stderr)
+      ) {
+        return {
+          ready: false,
+          error: `Failed to verify worktree: ${errorDetail}`,
+          errorType: "runtime_start_failed",
+        };
+      }
+
+      return {
+        ready: false,
+        error: WORKSPACE_REPO_MISSING_ERROR,
+        errorType: "runtime_not_ready",
+      };
+    }
+
+    if (worktreeResult.stdout.trim() !== "true") {
       return {
         ready: false,
         error: WORKSPACE_REPO_MISSING_ERROR,

@@ -35,6 +35,119 @@ describe("SSHRuntime constructor", () => {
   });
 });
 
+describe("SSHRuntime base repo config normalization", () => {
+  type NormalizeBaseRepoSharedConfig = (
+    baseRepoPathArg: string,
+    abortSignal?: AbortSignal
+  ) => Promise<boolean>;
+
+  let execBufferedSpy: ReturnType<typeof spyOn<typeof runtimeHelpers, "execBuffered">> | null =
+    null;
+  let runtime: SSHRuntime;
+
+  beforeEach(() => {
+    const config = { host: "example.com", srcBaseDir: "/home/user/src" };
+    runtime = new SSHRuntime(config, createSSHTransport(config, false));
+  });
+
+  afterEach(() => {
+    execBufferedSpy?.mockRestore();
+    execBufferedSpy = null;
+  });
+
+  function getNormalizeBaseRepoSharedConfig(): NormalizeBaseRepoSharedConfig {
+    const normalizeUnknown: unknown = Reflect.get(runtime, "normalizeBaseRepoSharedConfig");
+    if (typeof normalizeUnknown !== "function") {
+      throw new Error("normalizeBaseRepoSharedConfig is unavailable");
+    }
+
+    return normalizeUnknown as NormalizeBaseRepoSharedConfig;
+  }
+
+  function normalizeBaseRepoSharedConfig(): Promise<boolean> {
+    return getNormalizeBaseRepoSharedConfig().call(
+      runtime,
+      '"/home/user/src/project/.mux-base.git"'
+    );
+  }
+
+  it("removes a local core.bare entry from the shared base repo config", async () => {
+    execBufferedSpy = spyOn(runtimeHelpers, "execBuffered").mockResolvedValue({
+      stdout: "",
+      stderr: "",
+      exitCode: 0,
+      duration: 0,
+    });
+
+    expect(await normalizeBaseRepoSharedConfig()).toBe(true);
+    expect(execBufferedSpy).toHaveBeenCalledWith(
+      runtime,
+      expect.stringContaining("config --local --unset-all core.bare"),
+      expect.objectContaining({ cwd: "/tmp", timeout: 10 })
+    );
+  });
+
+  it("treats missing local core.bare config as already normalized", async () => {
+    execBufferedSpy = spyOn(runtimeHelpers, "execBuffered").mockResolvedValue({
+      stdout: "",
+      stderr: "",
+      exitCode: 5,
+      duration: 0,
+    });
+
+    expect(await normalizeBaseRepoSharedConfig()).toBe(false);
+  });
+
+  it("treats lock conflicts as a no-op when another writer already removed core.bare", async () => {
+    execBufferedSpy = spyOn(runtimeHelpers, "execBuffered")
+      .mockResolvedValueOnce({
+        stdout: "",
+        stderr: "error: could not lock config file config: File exists",
+        exitCode: 255,
+        duration: 0,
+      })
+      .mockResolvedValueOnce({
+        stdout: "",
+        stderr: "",
+        exitCode: 1,
+        duration: 0,
+      });
+
+    expect(await normalizeBaseRepoSharedConfig()).toBe(false);
+    expect(execBufferedSpy).toHaveBeenNthCalledWith(
+      2,
+      runtime,
+      expect.stringContaining("config --local --get core.bare"),
+      expect.objectContaining({ cwd: "/tmp", timeout: 10 })
+    );
+  });
+
+  it("retries lock conflicts while the shared core.bare entry still exists", async () => {
+    execBufferedSpy = spyOn(runtimeHelpers, "execBuffered")
+      .mockResolvedValueOnce({
+        stdout: "",
+        stderr: "error: could not lock config file config: File exists",
+        exitCode: 255,
+        duration: 0,
+      })
+      .mockResolvedValueOnce({
+        stdout: "true\n",
+        stderr: "",
+        exitCode: 0,
+        duration: 0,
+      })
+      .mockResolvedValueOnce({
+        stdout: "",
+        stderr: "",
+        exitCode: 0,
+        duration: 0,
+      });
+
+    expect(await normalizeBaseRepoSharedConfig()).toBe(true);
+    expect(execBufferedSpy).toHaveBeenCalledTimes(3);
+  });
+});
+
 describe("SSHRuntime.ensureReady repository checks", () => {
   let execBufferedSpy: ReturnType<typeof spyOn<typeof runtimeHelpers, "execBuffered">> | null =
     null;
@@ -56,15 +169,32 @@ describe("SSHRuntime.ensureReady repository checks", () => {
   it("accepts worktrees where .git is a file", async () => {
     execBufferedSpy = spyOn(runtimeHelpers, "execBuffered")
       .mockResolvedValueOnce({ stdout: "", stderr: "", exitCode: 0, duration: 0 })
-      .mockResolvedValueOnce({ stdout: ".git", stderr: "", exitCode: 0, duration: 0 });
+      .mockResolvedValueOnce({ stdout: ".git", stderr: "", exitCode: 0, duration: 0 })
+      .mockResolvedValueOnce({ stdout: "true\n", stderr: "", exitCode: 0, duration: 0 });
 
     const result = await runtime.ensureReady();
 
-    expect(execBufferedSpy).toHaveBeenCalledTimes(2);
+    expect(execBufferedSpy).toHaveBeenCalledTimes(3);
     const firstCommand = execBufferedSpy?.mock.calls[0]?.[1];
     expect(firstCommand).toContain("test -d");
     expect(firstCommand).toContain("test -f");
+    const thirdCommand = execBufferedSpy?.mock.calls[2]?.[1];
+    expect(thirdCommand).toContain("rev-parse --is-inside-work-tree");
     expect(result).toEqual({ ready: true });
+  });
+
+  it("returns runtime_not_ready when git reports the workspace is not inside a work tree", async () => {
+    execBufferedSpy = spyOn(runtimeHelpers, "execBuffered")
+      .mockResolvedValueOnce({ stdout: "", stderr: "", exitCode: 0, duration: 0 })
+      .mockResolvedValueOnce({ stdout: ".git", stderr: "", exitCode: 0, duration: 0 })
+      .mockResolvedValueOnce({ stdout: "false\n", stderr: "", exitCode: 0, duration: 0 });
+
+    const result = await runtime.ensureReady();
+
+    expect(result.ready).toBe(false);
+    if (!result.ready) {
+      expect(result.errorType).toBe("runtime_not_ready");
+    }
   });
 
   it("returns runtime_not_ready when the repo is missing", async () => {
