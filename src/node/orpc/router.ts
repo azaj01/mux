@@ -1111,6 +1111,68 @@ export const router = (authToken?: string) => {
             localBridgeBaseUrl: serverInfo.baseUrl,
           };
         }),
+      control: t
+        .input(schemas.browser.control.input)
+        .output(schemas.browser.control.output)
+        .handler(async ({ context, input }) => {
+          const commandToken = context.browserSessionStateHub.markLoading(
+            input.workspaceId,
+            input.sessionName
+          );
+
+          try {
+            const result = await context.browserControlService.executeControl(input);
+            if (result.success) {
+              const urlResult = await context.browserControlService.getUrl(
+                input.workspaceId,
+                input.sessionName,
+                { skipSessionValidation: true }
+              );
+              context.browserSessionStateHub.markLoaded(
+                input.workspaceId,
+                input.sessionName,
+                urlResult.error == null ? urlResult.url : undefined,
+                commandToken
+              );
+            } else {
+              context.browserSessionStateHub.markLoaded(
+                input.workspaceId,
+                input.sessionName,
+                undefined,
+                commandToken
+              );
+            }
+            return result;
+          } catch (error) {
+            try {
+              const urlResult = await context.browserControlService.getUrl(
+                input.workspaceId,
+                input.sessionName,
+                { skipSessionValidation: true }
+              );
+              context.browserSessionStateHub.markLoaded(
+                input.workspaceId,
+                input.sessionName,
+                urlResult.error == null ? urlResult.url : undefined,
+                commandToken
+              );
+            } catch {
+              context.browserSessionStateHub.markLoaded(
+                input.workspaceId,
+                input.sessionName,
+                undefined,
+                commandToken
+              );
+            }
+            throw error;
+          }
+        }),
+      getUrl: t
+        .input(schemas.browser.getUrl.input)
+        .output(schemas.browser.getUrl.output)
+        .handler(async ({ context, input }) => {
+          return await context.browserControlService.getUrl(input.workspaceId, input.sessionName);
+        }),
     },
     uiLayouts: {
       getAll: t
