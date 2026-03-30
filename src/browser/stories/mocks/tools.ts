@@ -1,257 +1,21 @@
-/**
- * Mock factory for full-app Storybook stories.
- *
- * Design philosophy:
- * - All visual states should be tested in context (full app), never in isolation
- * - Factory provides composable building blocks for different scenarios
- * - Keep mocks minimal but sufficient to exercise all visual paths
- */
-
-import type { ProjectConfig } from "@/node/config";
-import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import type { WorkspaceChatMessage, ChatMuxMessage } from "@/common/orpc/types";
-import type { TodoItem } from "@/common/types/tools";
 import type {
-  MuxMessageMetadata,
   MuxTextPart,
   MuxReasoningPart,
   MuxFilePart,
   MuxToolPart,
 } from "@/common/types/message";
-import { DEFAULT_MODEL } from "@/common/constants/knownModels";
+import type {
+  CodeExecutionResult,
+  NestedToolCall,
+} from "@/browser/features/Tools/Shared/codeExecutionTypes";
+import type { TodoItem } from "@/common/types/tools";
 
 /** Part type for message construction */
 type MuxPart = MuxTextPart | MuxReasoningPart | MuxFilePart | MuxToolPart;
-import type { RuntimeConfig } from "@/common/types/runtime";
-import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
-import { NOW, STABLE_TIMESTAMP } from "./storyTime";
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// STABLE TIMESTAMPS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-export { NOW, STABLE_TIMESTAMP };
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// WORKSPACE FACTORY
-// ═══════════════════════════════════════════════════════════════════════════════
-
-export interface WorkspaceFixture {
-  id: string;
-  name: string;
-  projectPath: string;
-  projectName: string;
-  runtimeConfig?: RuntimeConfig;
-  createdAt?: string;
-  bestOf?: FrontendWorkspaceMetadata["bestOf"];
-  title?: string;
-  transcriptOnly?: boolean;
-}
-
-/** Create a workspace with sensible defaults */
-export function createWorkspace(
-  opts: Partial<WorkspaceFixture> & { id: string; name: string; projectName: string }
-): FrontendWorkspaceMetadata {
-  const projectPath = opts.projectPath ?? `/home/user/projects/${opts.projectName}`;
-  const safeName = opts.name.replace(/\//g, "-");
-  return {
-    id: opts.id,
-    name: opts.name,
-    projectPath,
-    projectName: opts.projectName,
-    namedWorkspacePath: `/home/user/.mux/src/${opts.projectName}/${safeName}`,
-    runtimeConfig: opts.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG,
-    // Default to current time so workspaces aren't filtered as "old" by age-based UI
-    createdAt: opts.createdAt ?? new Date().toISOString(),
-    title: opts.title,
-    bestOf: opts.bestOf,
-    transcriptOnly: opts.transcriptOnly,
-  };
-}
-
-/** Create SSH workspace */
-export function createSSHWorkspace(
-  opts: Partial<WorkspaceFixture> & { id: string; name: string; projectName: string; host: string }
-): FrontendWorkspaceMetadata {
-  return createWorkspace({
-    ...opts,
-    runtimeConfig: {
-      type: "ssh",
-      host: opts.host,
-      srcBaseDir: "/home/user/.mux/src",
-    },
-  });
-}
-
-/** Create local project-dir workspace (no isolation, uses project path directly) */
-export function createLocalWorkspace(
-  opts: Partial<WorkspaceFixture> & { id: string; name: string; projectName: string }
-): FrontendWorkspaceMetadata {
-  return createWorkspace({
-    ...opts,
-    runtimeConfig: { type: "local" },
-  });
-}
-
-/** Create workspace with incompatible runtime (for downgrade testing) */
-export function createIncompatibleWorkspace(
-  opts: Partial<WorkspaceFixture> & {
-    id: string;
-    name: string;
-    projectName: string;
-    incompatibleReason?: string;
-  }
-): FrontendWorkspaceMetadata {
-  return {
-    ...createWorkspace(opts),
-    incompatibleRuntime:
-      opts.incompatibleReason ??
-      "This workspace was created with a newer version of mux.\nPlease upgrade mux to use this workspace.",
-  };
-}
-
-/** Create an archived workspace (archived = archivedAt set, no unarchivedAt) */
-export function createArchivedWorkspace(
-  opts: Partial<WorkspaceFixture> & {
-    id: string;
-    name: string;
-    projectName: string;
-    archivedAt?: string;
-  }
-): FrontendWorkspaceMetadata {
-  return {
-    ...createWorkspace(opts),
-    archivedAt: opts.archivedAt ?? new Date(NOW - 86400000).toISOString(), // 1 day ago
-    // No unarchivedAt means it's archived (archivedAt > unarchivedAt where unarchivedAt is undefined)
-  };
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// PROJECT FACTORY
-// ═══════════════════════════════════════════════════════════════════════════════
-
-export interface ProjectFixture {
-  path: string;
-  workspaces: FrontendWorkspaceMetadata[];
-}
-
-/** Create project config from workspaces */
-export function createProjectConfig(workspaces: FrontendWorkspaceMetadata[]): ProjectConfig {
-  return {
-    workspaces: workspaces.map((ws) => ({
-      path: ws.namedWorkspacePath,
-      id: ws.id,
-      name: ws.name,
-    })),
-  };
-}
-
-/** Group workspaces into projects Map */
-export function groupWorkspacesByProject(
-  workspaces: FrontendWorkspaceMetadata[]
-): Map<string, ProjectConfig> {
-  const projects = new Map<string, ProjectConfig>();
-  const byProject = new Map<string, FrontendWorkspaceMetadata[]>();
-
-  for (const ws of workspaces) {
-    const existing = byProject.get(ws.projectPath) ?? [];
-    existing.push(ws);
-    byProject.set(ws.projectPath, existing);
-  }
-
-  for (const [path, wsList] of byProject) {
-    projects.set(path, createProjectConfig(wsList));
-  }
-
-  return projects;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// MESSAGE FACTORY
-// ═══════════════════════════════════════════════════════════════════════════════
-
-export function createUserMessage(
-  id: string,
-  text: string,
-  opts: {
-    historySequence: number;
-    timestamp?: number;
-    images?: string[];
-    muxMetadata?: MuxMessageMetadata;
-    /** Mark as synthetic (auto-generated by system, not user-typed). Shows "AUTO" badge. */
-    synthetic?: boolean;
-  }
-): ChatMuxMessage {
-  const parts: MuxPart[] = [{ type: "text", text }];
-  if (opts.images) {
-    for (const url of opts.images) {
-      parts.push({ type: "file", mediaType: "image/png", url });
-    }
-  }
-  return {
-    type: "message",
-    id,
-    role: "user",
-    parts,
-    metadata: {
-      historySequence: opts.historySequence,
-      timestamp: opts.timestamp ?? STABLE_TIMESTAMP,
-      muxMetadata: opts.muxMetadata,
-      ...(opts.synthetic && { synthetic: true, uiVisible: true }),
-    },
-  };
-}
-
-export function createAssistantMessage(
-  id: string,
-  text: string,
-  opts: {
-    historySequence: number;
-    timestamp?: number;
-    model?: string;
-    reasoning?: string;
-    toolCalls?: MuxPart[];
-    /** Mark as partial/interrupted message (unfinished stream) */
-    partial?: boolean;
-    /** Custom context usage for testing context meter display */
-    contextUsage?: { inputTokens: number; outputTokens: number; totalTokens?: number };
-  }
-): ChatMuxMessage {
-  const parts: MuxPart[] = [];
-  if (opts.reasoning) {
-    parts.push({ type: "reasoning", text: opts.reasoning });
-  }
-  parts.push({ type: "text", text });
-  if (opts.toolCalls) {
-    parts.push(...opts.toolCalls);
-  }
-  const contextUsage = opts.contextUsage ?? {
-    inputTokens: 100,
-    outputTokens: 50,
-    totalTokens: 150,
-  };
-  contextUsage.totalTokens ??= contextUsage.inputTokens + contextUsage.outputTokens;
-  return {
-    type: "message",
-    id,
-    role: "assistant",
-    parts,
-    metadata: {
-      historySequence: opts.historySequence,
-      timestamp: opts.timestamp ?? STABLE_TIMESTAMP,
-      model: opts.model ?? DEFAULT_MODEL,
-      usage: contextUsage,
-      contextUsage,
-      duration: 1000,
-      partial: opts.partial,
-    },
-  };
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TOOL CALL FACTORY
 // ═══════════════════════════════════════════════════════════════════════════════
-
 export function createFileReadTool(toolCallId: string, filePath: string, content: string): MuxPart {
   return {
     type: "dynamic-tool",
@@ -271,6 +35,37 @@ export function createFileEditTool(toolCallId: string, filePath: string, diff: s
     state: "output-available",
     input: { path: filePath, old_string: "...", new_string: "..." },
     output: { success: true, diff, edits_applied: 1 },
+  };
+}
+
+export function createBashOverflowTool(
+  toolCallId: string,
+  script: string,
+  notice: string,
+  truncated: { reason: string; totalLines: number },
+  timeoutSecs = 3,
+  durationMs = 50,
+  displayName = "Bash"
+): MuxPart {
+  return {
+    type: "dynamic-tool",
+    toolCallId,
+    toolName: "bash",
+    state: "output-available",
+    input: {
+      script,
+      run_in_background: false,
+      timeout_secs: timeoutSecs,
+      display_name: displayName,
+    },
+    output: {
+      success: true,
+      output: "",
+      note: notice,
+      exitCode: 0,
+      wall_duration_ms: durationMs,
+      truncated,
+    },
   };
 }
 
@@ -347,6 +142,22 @@ export function createTodoWriteTool(
     state: "output-available",
     input: { todos },
     output: { success: true, count: todos.length },
+  };
+}
+
+export function createStatusTool(
+  toolCallId: string,
+  emoji: string,
+  message: string,
+  url?: string
+): MuxPart {
+  return {
+    type: "dynamic-tool",
+    toolCallId,
+    toolName: "status_set",
+    state: "output-available",
+    input: { emoji, message, url },
+    output: { success: true, emoji, message, url },
   };
 }
 
@@ -467,11 +278,6 @@ export function withHookOutput(
 // CODE EXECUTION (PTC) TOOL FACTORIES
 // ═══════════════════════════════════════════════════════════════════════════════
 
-import type {
-  CodeExecutionResult,
-  NestedToolCall,
-} from "@/browser/features/Tools/Shared/codeExecutionTypes";
-
 /** Create a code_execution tool call with nested tools */
 export function createCodeExecutionTool(
   toolCallId: string,
@@ -505,7 +311,6 @@ export function createPendingCodeExecutionTool(
     nestedCalls,
   };
 }
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // BACKGROUND BASH TOOL FACTORIES
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -661,130 +466,6 @@ export function createBashBackgroundTerminateTool(
     },
   };
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// GIT STATUS MOCKS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-export interface GitStatusFixture {
-  ahead?: number;
-  behind?: number;
-  dirty?: number;
-  headCommit?: string;
-  originCommit?: string;
-
-  // Optional overrides for line-delta display (additions/deletions)
-  outgoingAdditions?: number;
-  outgoingDeletions?: number;
-  incomingAdditions?: number;
-  incomingDeletions?: number;
-}
-
-export function createGitStatusOutput(fixture: GitStatusFixture): string {
-  const { ahead = 0, behind = 0, dirty = 0 } = fixture;
-
-  // Provide deterministic defaults so existing stories still show something
-  // when the indicator switches to line-delta mode.
-  const outgoingAdditions = fixture.outgoingAdditions ?? ahead * 12 + dirty * 2;
-  const outgoingDeletions = fixture.outgoingDeletions ?? ahead * 4 + Math.max(0, dirty - 1);
-  const incomingAdditions = fixture.incomingAdditions ?? behind * 10;
-  const incomingDeletions = fixture.incomingDeletions ?? behind * 3;
-
-  const lines = ["---PRIMARY---", "main", "---AHEAD_BEHIND---", `${ahead} ${behind}`];
-  lines.push("---DIRTY---");
-  lines.push(String(dirty));
-  lines.push("---LINE_DELTA---");
-  lines.push(`${outgoingAdditions} ${outgoingDeletions} ${incomingAdditions} ${incomingDeletions}`);
-
-  return lines.join("\n");
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// MOCK API FACTORY
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/** Chat handler type for onChat callbacks */
-type ChatHandler = (callback: (event: WorkspaceChatMessage) => void) => () => void;
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// CHAT SCENARIO BUILDERS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/** Creates a chat handler that sends messages then caught-up */
-export function createStaticChatHandler(messages: ChatMuxMessage[]): ChatHandler {
-  return (callback) => {
-    setTimeout(() => {
-      for (const msg of messages) {
-        callback(msg);
-      }
-      callback({ type: "caught-up", hasOlderHistory: false });
-    }, 50);
-    // eslint-disable-next-line @typescript-eslint/no-empty-function
-    return () => {};
-  };
-}
-
-/** Creates a chat handler with streaming state */
-export function createStreamingChatHandler(opts: {
-  messages: ChatMuxMessage[];
-  streamingMessageId: string;
-  model: string;
-  historySequence: number;
-  streamText?: string;
-  pendingTool?: { toolCallId: string; toolName: string; args: object };
-}): ChatHandler {
-  return (callback) => {
-    setTimeout(() => {
-      // Send historical messages
-      for (const msg of opts.messages) {
-        callback(msg);
-      }
-      callback({ type: "caught-up", hasOlderHistory: false });
-
-      // Start streaming
-      callback({
-        type: "stream-start",
-        workspaceId: "mock",
-        messageId: opts.streamingMessageId,
-        model: opts.model,
-        historySequence: opts.historySequence,
-        startTime: Date.now(),
-      });
-
-      // Send text delta if provided
-      if (opts.streamText) {
-        callback({
-          type: "stream-delta",
-          workspaceId: "mock",
-          messageId: opts.streamingMessageId,
-          delta: opts.streamText,
-          tokens: 10,
-          timestamp: STABLE_TIMESTAMP,
-        });
-      }
-
-      // Send tool call start if provided
-      if (opts.pendingTool) {
-        callback({
-          type: "tool-call-start",
-          workspaceId: "mock",
-          messageId: opts.streamingMessageId,
-          toolCallId: opts.pendingTool.toolCallId,
-          toolName: opts.pendingTool.toolName,
-          args: opts.pendingTool.args,
-          tokens: 5,
-          timestamp: STABLE_TIMESTAMP,
-        });
-      }
-    }, 50);
-
-    // Keep the streaming state active, but avoid emitting periodic visible deltas.
-    // Those deltas can make visual snapshots flaky (different text length per run).
-    // eslint-disable-next-line @typescript-eslint/no-empty-function
-    return () => {};
-  };
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // TASK TOOL FACTORIES
 // ═══════════════════════════════════════════════════════════════════════════════
