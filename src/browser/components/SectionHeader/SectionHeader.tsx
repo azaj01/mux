@@ -107,7 +107,7 @@ export const SectionHeader: React.FC<SectionHeaderProps> = ({
 
   return (
     <div
-      className="group relative ml-4 flex items-center gap-1 py-1.5 pr-1 pl-3 select-none"
+      className="group relative ml-0 flex items-center gap-1 py-1.5 pr-1 pl-2.5 select-none"
       data-section-id={section.id}
     >
       {/* Expand/Collapse Button */}
@@ -180,8 +180,9 @@ export const SectionHeader: React.FC<SectionHeaderProps> = ({
         </button>
       )}
 
-      {/* Right-side controls: add chat + section actions */}
-      <div className="flex items-center opacity-0 transition-opacity group-hover:opacity-100 [@media(hover:none)_and_(pointer:coarse)]:opacity-100">
+      {/* Right-side controls: add chat + section actions. shrink-0 prevents flex
+          compression from squeezing buttons out of the visible area at narrow widths. */}
+      <div className="flex shrink-0 items-center opacity-0 transition-opacity group-hover:opacity-100 [@media(hover:none)_and_(pointer:coarse)]:opacity-100">
         {/* Add Chat — always visible on touch devices */}
         <Tooltip>
           <TooltipTrigger asChild>
