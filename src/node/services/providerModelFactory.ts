@@ -22,12 +22,22 @@ import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import type { ExternalSecretResolver } from "@/common/types/secrets";
 import { isOpReference } from "@/common/utils/opRef";
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
+import { isGatewayModelAccessibleFromAuthoritativeCatalog } from "@/common/utils/providers/gatewayModelCatalog";
+import { maybeGetProviderModelEntryId } from "@/common/utils/providers/modelEntries";
+import {
+  isCopilotModelAccessible,
+  selectCopilotApiMode,
+  toCopilotModelId,
+} from "@/common/utils/copilot/modelRouting";
+import { CopilotResponsesLanguageModel } from "@/node/services/copilot/copilotResponsesLanguageModel";
 import type { PolicyService } from "@/node/services/policyService";
 import type { ProviderService } from "@/node/services/providerService";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
 import type { DevToolsService } from "@/node/services/devToolsService";
 import { captureAndStripDevToolsHeader } from "@/node/services/devToolsHeaderCapture";
 import { createDevToolsMiddleware } from "@/node/services/devToolsMiddleware";
+import { log } from "@/node/services/log";
+import { resolveProviderOptionsNamespaceKey } from "@/common/utils/ai/providerOptions";
 import { resolveRoute, type RouteContext } from "@/common/routing";
 import {
   getExplicitGatewayPrefix as getExplicitGatewayProvider,
@@ -495,23 +505,55 @@ export function parseModelString(modelString: string): [string, string] {
 
 /**
  * Classify a Copilot API request as "user" or "agent" initiated by inspecting
- * the last message role in the request body. GitHub Copilot bills premium
+ * the last conversational item in the request body. GitHub Copilot bills premium
  * requests only for "user"-initiated calls.
  *
- * Heuristic: if the last message in the messages array has role "user",
- * this is a user-initiated turn. Everything else (tool results, assistant
- * continuations) is agent-initiated.
+ * Heuristic: if the last chat-completions message or Responses input item is a
+ * user turn, treat the request as user-initiated. Assistant continuations, tool
+ * calls, tool outputs, and stored item references are agent-initiated.
  */
 export function classifyCopilotInitiator(body: string | null | undefined): "user" | "agent" {
   try {
-    if (typeof body !== "string") return "user"; // can't parse → safe default
-    const parsed = JSON.parse(body) as { messages?: unknown[] };
+    if (typeof body !== "string") return "user"; // can't parse -> safe default
+    const parsed = JSON.parse(body) as { messages?: unknown[]; input?: unknown };
     const messages = parsed.messages;
-    if (!Array.isArray(messages) || messages.length === 0) return "user";
-    const last = messages[messages.length - 1] as { role?: string } | undefined;
-    return last?.role === "user" ? "user" : "agent";
+    if (Array.isArray(messages) && messages.length > 0) {
+      const last = messages[messages.length - 1] as { role?: string } | undefined;
+      return last?.role === "user" ? "user" : "agent";
+    }
+
+    const input = parsed.input;
+    if (Array.isArray(input)) {
+      for (let index = input.length - 1; index >= 0; index -= 1) {
+        const item: unknown = input[index];
+        if (typeof item !== "object" || item === null) {
+          continue;
+        }
+
+        const role = (item as { role?: unknown }).role;
+        if (typeof role === "string") {
+          if (role === "user") {
+            return "user";
+          }
+          if (role === "assistant") {
+            return "agent";
+          }
+          continue;
+        }
+
+        // AI SDK Responses conversion only emits non-role items for assistant or
+        // tool-driven state, such as function calls, tool outputs, reasoning, and
+        // item references. Treat those as agent-initiated to preserve Copilot billing.
+        const type = (item as { type?: unknown }).type;
+        if (typeof type === "string") {
+          return "agent";
+        }
+      }
+    }
+
+    return "user";
   } catch {
-    return "user"; // parse failure → safe fallback (don't hide usage)
+    return "user"; // parse failure -> safe fallback (don't hide usage)
   }
 }
 
@@ -540,6 +582,24 @@ export function modelCostsIncluded(model: LanguageModel): boolean {
   return (model as LanguageModelWithMuxCostsIncluded)[MUX_MODEL_COSTS_INCLUDED] === true;
 }
 
+const CODEX_ALLOWED_PARAMS = new Set([
+  "model",
+  "input",
+  "instructions",
+  "tools",
+  "tool_choice",
+  "parallel_tool_calls",
+  "stream",
+  "store",
+  "prompt_cache_key",
+  "reasoning",
+  "temperature",
+  "top_p",
+  "include",
+  "text", // structured output via Output.object -> text.format
+  "truncation",
+]);
+
 // ---------------------------------------------------------------------------
 // Content extraction
 // ---------------------------------------------------------------------------
@@ -564,6 +624,87 @@ function extractTextContent(content: unknown): string {
       .trim();
   }
   return "";
+}
+
+export function normalizeCodexResponsesBody(body: string): string {
+  const json = JSON.parse(body) as Record<string, unknown>;
+  const truncation = json.truncation;
+  if (truncation !== "auto" && truncation !== "disabled") {
+    json.truncation = "disabled";
+  }
+
+  // Codex-compatible Responses requests must disable storage and strip unsupported params.
+  json.store = false;
+
+  for (const key of Object.keys(json)) {
+    if (!CODEX_ALLOWED_PARAMS.has(key)) {
+      delete json[key];
+    }
+  }
+
+  // item_reference entries depend on stored state lookups, which fail with store=false.
+  if (Array.isArray(json.input)) {
+    json.input = (json.input as Array<Record<string, unknown>>).filter(
+      (item) => !(item && typeof item === "object" && item.type === "item_reference")
+    );
+  }
+
+  const existingInstructions =
+    typeof json.instructions === "string" ? json.instructions.trim() : "";
+  if (existingInstructions.length === 0) {
+    const derivedParts: string[] = [];
+    const keptInput: unknown[] = [];
+
+    const responseInput = json.input;
+    if (Array.isArray(responseInput)) {
+      for (const item of responseInput as unknown[]) {
+        if (!item || typeof item !== "object") {
+          keptInput.push(item);
+          continue;
+        }
+
+        const role = (item as { role?: unknown }).role;
+        if (role !== "system" && role !== "developer") {
+          keptInput.push(item);
+          continue;
+        }
+
+        const content = (item as { content?: unknown }).content;
+        const text = extractTextContent(content);
+        if (text.length > 0) {
+          derivedParts.push(text);
+        }
+      }
+
+      json.input = keptInput;
+    }
+
+    const joined = derivedParts.join("\n\n").trim();
+    json.instructions = joined.length > 0 ? joined : "You are a helpful assistant.";
+  }
+
+  return JSON.stringify(json);
+}
+
+function getConfiguredProviderModelIds(providerConfig: ProviderConfig | undefined): string[] {
+  const models = providerConfig?.models;
+  if (!Array.isArray(models)) {
+    return [];
+  }
+
+  return models.flatMap((entry) => {
+    const modelId = maybeGetProviderModelEntryId(entry);
+    return modelId == null ? [] : [modelId];
+  });
+}
+
+function createGatewayModelAccessibilityChecker(providersConfig: ProvidersConfig) {
+  return (gateway: string, gatewayModelId: string): boolean =>
+    isGatewayModelAccessibleFromAuthoritativeCatalog(
+      gateway,
+      gatewayModelId,
+      providersConfig[gateway]?.models
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1007,10 +1148,8 @@ export class ProviderModelFactory {
               let nextInit: Parameters<typeof fetch>[1] | undefined = init;
 
               const body = init?.body;
-              // Only parse the JSON body when routing through Codex OAuth — it needs
-              // instruction lifting, store=false, and truncation enforcement.  For
-              // non-Codex requests the SDK already sends the correct truncation value
-              // via providerOptions, so we skip the expensive parse + re-stringify.
+              // Only parse the JSON body when routing through Codex OAuth, since Codex
+              // requires instruction lifting, store=false, and Responses truncation.
               if (
                 shouldRouteThroughCodexOauth &&
                 isOpenAIResponses &&
@@ -1018,106 +1157,13 @@ export class ProviderModelFactory {
                 typeof body === "string"
               ) {
                 try {
-                  const json = JSON.parse(body) as Record<string, unknown>;
-                  const truncation = json.truncation;
-                  if (truncation !== "auto" && truncation !== "disabled") {
-                    json.truncation = "disabled";
-                  }
-
-                  // Codex OAuth (chatgpt.com/backend-api/codex/responses) rejects requests unless
-                  // `instructions` is present and non-empty, and `store` is set to false.
-                  // The AI SDK maps `system` prompts into the `input` array
-                  // (role: system|developer) but does *not* automatically populate
-                  // `instructions`, so we lift all system prompts into `instructions` when
-                  // routing through Codex OAuth.
-
-                  // Codex endpoint requires store=false and only accepts a subset of the
-                  // standard OpenAI Responses API parameters. Use an allowlist to strip
-                  // everything the endpoint doesn't understand (it rejects unknown params
-                  // with 400).
-                  json.store = false;
-
-                  const CODEX_ALLOWED_PARAMS = new Set([
-                    "model",
-                    "input",
-                    "instructions",
-                    "tools",
-                    "tool_choice",
-                    "parallel_tool_calls",
-                    "stream",
-                    "store",
-                    "prompt_cache_key",
-                    "reasoning",
-                    "temperature",
-                    "top_p",
-                    "include",
-                    "text", // structured output via Output.object → text.format
-                  ]);
-
-                  for (const key of Object.keys(json)) {
-                    if (!CODEX_ALLOWED_PARAMS.has(key)) {
-                      delete json[key];
-                    }
-                  }
-
-                  // Filter out item_reference entries from the input. The AI SDK sends
-                  // these as an optimization when store=true — bare { type: "item_reference",
-                  // id: "rs_..." } objects that the server expands by looking up stored
-                  // content. With store=false (required for Codex), these lookups fail.
-                  // The full inline content is always present alongside references, so
-                  // removing them doesn't lose conversation context.
-                  if (Array.isArray(json.input)) {
-                    json.input = (json.input as Array<Record<string, unknown>>).filter(
-                      (item) =>
-                        !(item && typeof item === "object" && item.type === "item_reference")
-                    );
-                  }
-
-                  const existingInstructions =
-                    typeof json.instructions === "string" ? json.instructions.trim() : "";
-
-                  if (existingInstructions.length === 0) {
-                    const derivedParts: string[] = [];
-                    const keptInput: unknown[] = [];
-
-                    const responseInput = json.input;
-                    if (Array.isArray(responseInput)) {
-                      for (const item of responseInput as unknown[]) {
-                        if (!item || typeof item !== "object") {
-                          keptInput.push(item);
-                          continue;
-                        }
-
-                        const role = (item as { role?: unknown }).role;
-                        if (role !== "system" && role !== "developer") {
-                          keptInput.push(item);
-                          continue;
-                        }
-
-                        // Extract text from string content or structured content arrays
-                        // (AI SDK may produce [{type:"text", text:"..."}])
-                        const content = (item as { content?: unknown }).content;
-                        const text = extractTextContent(content);
-                        if (text.length > 0) {
-                          derivedParts.push(text);
-                        }
-                        // Drop this system/developer item from input (don't push to keptInput)
-                      }
-
-                      json.input = keptInput;
-                    }
-
-                    const joined = derivedParts.join("\n\n").trim();
-                    json.instructions = joined.length > 0 ? joined : "You are a helpful assistant.";
-                  }
-
-                  // Clone headers to avoid mutating caller-provided objects
                   const headers = new Headers(init?.headers);
-                  // Remove content-length if present, since body will change
                   headers.delete("content-length");
-
-                  const newBody = JSON.stringify(json);
-                  nextInit = { ...init, headers, body: newBody };
+                  nextInit = {
+                    ...init,
+                    headers,
+                    body: normalizeCodexResponsesBody(body),
+                  };
                 } catch {
                   // If body isn't JSON, fall through to normal fetch (but still allow Codex routing).
                 }
@@ -1514,7 +1560,7 @@ export class ProviderModelFactory {
         return Ok(model);
       }
 
-      // GitHub Copilot — OpenAI-compatible with custom auth headers
+      // GitHub Copilot chooses a stock OpenAI chat model or a custom Responses model per route.
       if (providerName === "github-copilot") {
         const creds = resolveProviderCredentials("github-copilot" as ProviderName, providerConfig);
         if (!creds.isConfigured) {
@@ -1525,29 +1571,81 @@ export class ProviderModelFactory {
           return Err({ type: "api_key_not_found", provider: providerName });
         }
 
-        const { createOpenAICompatible } = await PROVIDER_REGISTRY["github-copilot"]();
+        const availableModels = getConfiguredProviderModelIds(providerConfig);
+        if (!isCopilotModelAccessible(modelId, availableModels)) {
+          return Err({
+            type: "model_not_available",
+            provider: providerName,
+            modelId,
+          });
+        }
 
         const baseFetch = getProviderFetch(providerConfig);
         const copilotFetchFn = async (
           input: Parameters<typeof fetch>[0],
           init?: Parameters<typeof fetch>[1]
         ) => {
-          const headers = new Headers(init?.headers);
+          const headers = new Headers(input instanceof Request ? input.headers : undefined);
+          if (init?.headers) {
+            for (const [key, value] of new Headers(init.headers).entries()) {
+              headers.set(key, value);
+            }
+          }
           headers.set("Authorization", `Bearer ${resolvedApiKey ?? ""}`);
           headers.set("Openai-Intent", "conversation-edits");
+
+          const urlString = (() => {
+            if (typeof input === "string") {
+              return input;
+            }
+            if (input instanceof URL) {
+              return input.toString();
+            }
+            if (typeof input === "object" && input !== null && "url" in input) {
+              const possibleUrl = (input as { url?: unknown }).url;
+              if (typeof possibleUrl === "string") {
+                return possibleUrl;
+              }
+            }
+            return "";
+          })();
+
+          const method = (
+            init?.method ?? (input instanceof Request ? input.method : "GET")
+          ).toUpperCase();
+          // normalizeCodexResponsesBody() applies only to the stock OpenAI provider's
+          // /v1/responses path (used by Codex OAuth). The custom CopilotResponsesLanguageModel
+          // posts directly to /responses, intentionally bypassing this normalization.
+          const isResponsesRequest = /\/v1\/responses(\?|$)/.test(urlString);
+
+          let nextInit: Parameters<typeof fetch>[1] = { ...init, headers };
 
           // Resolve request body text for billing classification.
           // Standard AI SDK path: init.body is a JSON string.
           // Request object path: clone + read body text so the original stream
           // remains intact for the real network request.
-          let bodyText: string | undefined;
+          let originalBodyText: string | undefined;
           if (typeof init?.body === "string") {
-            bodyText = init.body;
+            originalBodyText = init.body;
           } else if (input instanceof Request) {
             try {
-              bodyText = await input.clone().text();
+              originalBodyText = await input.clone().text();
             } catch {
               // Fall back to undefined so classifyCopilotInitiator defaults to "user".
+            }
+          }
+
+          if (typeof originalBodyText === "string" && method === "POST" && isResponsesRequest) {
+            try {
+              const normalizedBody = normalizeCodexResponsesBody(originalBodyText);
+              headers.delete("content-length");
+              nextInit = {
+                ...nextInit,
+                headers,
+                body: normalizedBody,
+              };
+            } catch {
+              // If body isn't JSON, keep the original request body for Copilot.
             }
           }
 
@@ -1556,22 +1654,45 @@ export class ProviderModelFactory {
           // If the caller explicitly marked this as agent-initiated (e.g., sub-agent,
           // compaction, internal utility), skip the heuristic and always use "agent".
           const initiator =
-            opts?.agentInitiated === true ? "agent" : classifyCopilotInitiator(bodyText);
+            opts?.agentInitiated === true ? "agent" : classifyCopilotInitiator(originalBodyText);
           headers.set("X-Initiator", initiator);
           headers.delete("x-api-key");
-          return baseFetch(input, { ...init, headers });
+          return baseFetch(input, nextInit);
         };
         const copilotFetch = Object.assign(copilotFetchFn, baseFetch) as typeof fetch;
         const providerFetch = copilotFetch;
-
         const baseURL = providerConfig.baseURL ?? "https://api.githubcopilot.com";
-        const provider = createOpenAICompatible({
-          name: "github-copilot",
+        const apiMode = selectCopilotApiMode(modelId);
+        const outboundCopilotModelId = toCopilotModelId(modelId);
+        log.debug(`GitHub Copilot model ${modelId} using ${apiMode} API mode`);
+
+        if (apiMode === "responses") {
+          // Copilot Codex models use a custom Responses language model
+          // that handles Copilot's SSE stream quirks (rotating item_id,
+          // text arriving via output_text.delta rather than inline).
+          const model = new CopilotResponsesLanguageModel({
+            modelId: outboundCopilotModelId,
+            fetch: providerFetch,
+            baseUrl: baseURL,
+          });
+          return Ok(model as LanguageModel);
+        }
+
+        const { createOpenAI } = await PROVIDER_REGISTRY.openai();
+        const providerOptionsNamespace = resolveProviderOptionsNamespaceKey(
+          "openai",
+          "github-copilot"
+        );
+        const provider = createOpenAI({
+          // Keep the SDK provider name aligned with buildProviderOptions() so
+          // Copilot-routed OpenAI reasoning settings land under the namespace
+          // that @ai-sdk/openai actually reads.
+          name: providerOptionsNamespace,
           baseURL,
-          apiKey: "copilot", // placeholder — actual auth via custom fetch
+          apiKey: "copilot", // placeholder, actual auth via custom fetch
           fetch: providerFetch,
         });
-        return Ok(provider.chatModel(modelId));
+        return Ok(provider.chat(outboundCopilotModelId));
       }
 
       // Generic handler for simple providers (standard API key + factory pattern)
@@ -1714,6 +1835,7 @@ export class ProviderModelFactory {
   private resolveModelRoute(canonicalModel: string): RouteContext {
     const config = this.config.loadConfigOrDefault();
     const providersConfig = this.config.loadProvidersConfig?.() ?? {};
+    const isGatewayModelAccessible = createGatewayModelAccessibilityChecker(providersConfig);
     return resolveRoute(
       canonicalModel,
       config.routePriority ?? ["direct"],
@@ -1728,7 +1850,8 @@ export class ProviderModelFactory {
           providersConfig,
           config
         );
-      }
+      },
+      isGatewayModelAccessible
     );
   }
 
@@ -1760,6 +1883,7 @@ export class ProviderModelFactory {
     const originProvider = originProviderName as ProviderName;
     const config = this.config.loadConfigOrDefault();
     const providersConfig = this.config.loadProvidersConfig() ?? {};
+    const isGatewayModelAccessible = createGatewayModelAccessibilityChecker(providersConfig);
     const routeContext =
       typeof modelKeyOrRouteContext === "object" && modelKeyOrRouteContext != null
         ? modelKeyOrRouteContext
@@ -1779,7 +1903,8 @@ export class ProviderModelFactory {
                 providersConfig,
                 config
               );
-            }
+            },
+            isGatewayModelAccessible
           );
 
     let resolvedRouteProvider = routeContext.routeProvider;

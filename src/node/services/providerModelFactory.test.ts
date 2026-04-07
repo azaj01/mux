@@ -4,6 +4,10 @@ import * as os from "os";
 import * as path from "path";
 import { Config } from "@/node/config";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { CODEX_ENDPOINT } from "@/common/constants/codexOAuth";
+import { PROVIDER_REGISTRY } from "@/common/constants/providers";
+import { resolveProviderOptionsNamespaceKey } from "@/common/utils/ai/providerOptions";
+import { Ok } from "@/common/types/result";
 import {
   ProviderModelFactory,
   buildAIProviderRequestHeaders,
@@ -11,8 +15,10 @@ import {
   countAnthropicCacheBreakpoints,
   modelCostsIncluded,
   MUX_AI_PROVIDER_USER_AGENT,
+  normalizeCodexResponsesBody,
   resolveAIProviderHeaderSource,
 } from "./providerModelFactory";
+import { CodexOauthService } from "./codexOauthService";
 import { ProviderService } from "./providerService";
 
 async function withTempConfig(
@@ -29,6 +35,63 @@ async function withTempConfig(
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 }
+
+describe("normalizeCodexResponsesBody", () => {
+  it("enforces Codex-compatible fields and lifts system prompts into instructions", () => {
+    const normalized = JSON.parse(
+      normalizeCodexResponsesBody(
+        JSON.stringify({
+          model: "gpt-5.3-codex",
+          input: [
+            { role: "system", content: "Follow project rules." },
+            {
+              role: "developer",
+              content: [{ type: "text", text: "Use concise updates." }],
+            },
+            { role: "user", content: "Ship the fix." },
+            { type: "item_reference", id: "rs_123" },
+          ],
+          store: true,
+          truncation: "server-default",
+          temperature: 0.2,
+          metadata: { ignored: true },
+          text: { format: { type: "json_schema", name: "result" } },
+        })
+      )
+    ) as {
+      instructions: string;
+      input: Array<Record<string, unknown>>;
+      metadata?: unknown;
+      store: boolean;
+      temperature: number;
+      text: unknown;
+      truncation: string;
+    };
+
+    expect(normalized.store).toBe(false);
+    expect(normalized.truncation).toBe("disabled");
+    expect(normalized.temperature).toBe(0.2);
+    expect(normalized.text).toEqual({ format: { type: "json_schema", name: "result" } });
+    expect(normalized.metadata).toBeUndefined();
+    expect(normalized.instructions).toBe("Follow project rules.\n\nUse concise updates.");
+    expect(normalized.input).toEqual([{ role: "user", content: "Ship the fix." }]);
+  });
+
+  it("preserves explicit auto truncation", () => {
+    const normalized = JSON.parse(
+      normalizeCodexResponsesBody(
+        JSON.stringify({
+          model: "gpt-5.3-codex",
+          input: [{ role: "user", content: "Hello" }],
+          truncation: "auto",
+        })
+      )
+    ) as { truncation: string; store: boolean };
+
+    expect(normalized.truncation).toBe("auto");
+    expect(normalized.store).toBe(false);
+  });
+});
 
 describe("ProviderModelFactory.createModel", () => {
   it("returns provider_disabled when a non-gateway provider is disabled", async () => {
@@ -91,6 +154,379 @@ describe("ProviderModelFactory.createModel", () => {
       if (!result.success) {
         expect(result.error.type).not.toBe("provider_disabled");
       }
+    });
+  });
+});
+
+describe("ProviderModelFactory GitHub Copilot", () => {
+  it("creates routed gpt-5.4 models with the chat completions API mode", async () => {
+    await withTempConfig(async (config, factory) => {
+      const originalOpenAIRegistry = PROVIDER_REGISTRY.openai;
+      let capturedProviderName: string | undefined;
+
+      config.saveProvidersConfig({
+        "github-copilot": {
+          apiKey: "copilot-token",
+          models: ["gpt-5.4"],
+        },
+      });
+
+      PROVIDER_REGISTRY.openai = async () => {
+        const module = await originalOpenAIRegistry();
+        return {
+          ...module,
+          createOpenAI: (options) => {
+            capturedProviderName = options?.name;
+            return module.createOpenAI(options);
+          },
+        };
+      };
+
+      try {
+        const projectConfig = config.loadConfigOrDefault();
+        await config.saveConfig({
+          ...projectConfig,
+          routePriority: ["github-copilot", "direct"],
+        });
+
+        const result = await factory.resolveAndCreateModel("openai:gpt-5.4", "off");
+        expect(result.success).toBe(true);
+        if (!result.success) {
+          return;
+        }
+
+        expect(capturedProviderName).toBe(
+          resolveProviderOptionsNamespaceKey("openai", "github-copilot")
+        );
+        expect((result.data.model as { provider?: unknown }).provider).toBe("github-copilot.chat");
+        expect(result.data.routeProvider).toBe("github-copilot");
+        expect(result.data.effectiveModelString).toBe("github-copilot:gpt-5.4");
+        expect(result.data.model.constructor.name).toBe("OpenAIChatLanguageModel");
+      } finally {
+        PROVIDER_REGISTRY.openai = originalOpenAIRegistry;
+      }
+    });
+  });
+
+  it("rewrites Claude model ids back to Copilot's dot form before creating chat models", async () => {
+    await withTempConfig(async (config, factory) => {
+      const originalOpenAIRegistry = PROVIDER_REGISTRY.openai;
+      let capturedModelId: string | undefined;
+
+      config.saveProvidersConfig({
+        "github-copilot": {
+          apiKey: "copilot-token",
+          models: ["claude-opus-4.6"],
+        },
+      });
+
+      PROVIDER_REGISTRY.openai = async () => {
+        const module = await originalOpenAIRegistry();
+        return {
+          ...module,
+          createOpenAI: (options) => {
+            const provider = module.createOpenAI(options);
+            return Object.assign(
+              ((requestedModelId: Parameters<typeof provider>[0]) =>
+                provider(requestedModelId)) as typeof provider,
+              provider,
+              {
+                chat(requestedModelId: Parameters<typeof provider.chat>[0]) {
+                  capturedModelId = requestedModelId;
+                  return provider.chat(requestedModelId);
+                },
+              }
+            );
+          },
+        };
+      };
+
+      try {
+        const result = await factory.createModel("github-copilot:claude-opus-4-6");
+        expect(result.success).toBe(true);
+        if (!result.success) {
+          return;
+        }
+
+        expect(capturedModelId).toBe("claude-opus-4.6");
+        expect((result.data as { provider?: unknown }).provider).toBe("github-copilot.chat");
+      } finally {
+        PROVIDER_REGISTRY.openai = originalOpenAIRegistry;
+      }
+    });
+  });
+
+  it("routes Codex models through the Copilot Responses API path", async () => {
+    await withTempConfig(async (config, factory) => {
+      config.saveProvidersConfig({
+        "github-copilot": {
+          apiKey: "copilot-token",
+          models: ["gpt-5.3-codex"],
+        },
+      });
+
+      const projectConfig = config.loadConfigOrDefault();
+      await config.saveConfig({
+        ...projectConfig,
+        routePriority: ["github-copilot", "direct"],
+      });
+
+      const result = await factory.resolveAndCreateModel("openai:gpt-5.3-codex", "off");
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        return;
+      }
+
+      expect((result.data.model as { provider?: unknown }).provider).toBe(
+        "github-copilot.responses"
+      );
+      expect(result.data.routeProvider).toBe("github-copilot");
+      expect(result.data.effectiveModelString).toBe("github-copilot:gpt-5.3-codex");
+      expect(result.data.model.constructor.name).toBe("CopilotResponsesLanguageModel");
+    });
+  });
+
+  it("normalizes Request bodies for the Codex OAuth responses endpoint", async () => {
+    await withTempConfig(async (config, factory) => {
+      const originalOpenAIRegistry = PROVIDER_REGISTRY.openai;
+      const requests: Array<{
+        input: Parameters<typeof fetch>[0];
+        init?: Parameters<typeof fetch>[1];
+      }> = [];
+      let capturedFetch: typeof fetch | undefined;
+      const auth = {
+        type: "oauth" as const,
+        access: "test-access-token",
+        refresh: "test-refresh-token",
+        expires: Date.now() + 60_000,
+        accountId: "test-account-id",
+      };
+
+      const baseFetch = (
+        input: Parameters<typeof fetch>[0],
+        init?: Parameters<typeof fetch>[1]
+      ) => {
+        requests.push({ input, init });
+
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              id: "resp_test",
+              created_at: 0,
+              model: "gpt-5.3-codex",
+              output: [
+                {
+                  type: "message",
+                  role: "assistant",
+                  id: "msg_test",
+                  content: [{ type: "output_text", text: "ok", annotations: [] }],
+                },
+              ],
+              usage: {
+                input_tokens: 1,
+                output_tokens: 1,
+              },
+            }),
+            {
+              headers: {
+                "Content-Type": "application/json",
+              },
+            }
+          )
+        );
+      };
+
+      config.loadProvidersConfig = () => ({
+        openai: {
+          codexOauth: auth,
+          fetch: baseFetch,
+        },
+      });
+
+      const codexOauthService = Object.create(CodexOauthService.prototype) as CodexOauthService;
+      codexOauthService.getValidAuth = () => Promise.resolve(Ok(auth));
+      factory.codexOauthService = codexOauthService;
+
+      PROVIDER_REGISTRY.openai = async () => {
+        const module = await originalOpenAIRegistry();
+        return {
+          ...module,
+          createOpenAI: (options) => {
+            capturedFetch = options?.fetch;
+            return module.createOpenAI(options);
+          },
+        };
+      };
+
+      try {
+        const result = await factory.createModel("openai:gpt-5.3-codex");
+        expect(result.success).toBe(true);
+        if (!result.success) {
+          return;
+        }
+
+        if (!capturedFetch) {
+          throw new Error("Expected OpenAI fetch wrapper to be captured");
+        }
+
+        const originalBody = JSON.stringify({
+          model: "gpt-5.3-codex",
+          input: [
+            { role: "user", content: [{ type: "input_text", text: "Ship the fix." }] },
+            { type: "item_reference", id: "rs_123" },
+          ],
+          store: true,
+          truncation: "server-default",
+          metadata: { ignored: true },
+        });
+        const request = new Request("https://api.openai.com/v1/responses", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: "Bearer sdk-key",
+          },
+          body: originalBody,
+        });
+
+        await capturedFetch(request.url, {
+          method: request.method,
+          headers: request.headers,
+          body: originalBody,
+        });
+
+        expect(requests).toHaveLength(1);
+        expect(requests[0]?.input).toBe(CODEX_ENDPOINT);
+        expect(requests[0]?.init?.body).toBe(normalizeCodexResponsesBody(originalBody));
+
+        const headers = new Headers(requests[0]?.init?.headers);
+        expect(headers.get("authorization")).toBe("Bearer test-access-token");
+        expect(headers.get("chatgpt-account-id")).toBe("test-account-id");
+        expect(headers.get("content-type")).toBe("application/json");
+      } finally {
+        PROVIDER_REGISTRY.openai = originalOpenAIRegistry;
+      }
+    });
+  });
+
+  it("does not force store=false for Copilot Responses requests", async () => {
+    await withTempConfig(async (config, factory) => {
+      config.saveProvidersConfig({
+        "github-copilot": {
+          apiKey: "copilot-token",
+          models: ["gpt-5.3-codex"],
+        },
+      });
+
+      const result = await factory.createModel("github-copilot:gpt-5.3-codex");
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        return;
+      }
+
+      expect((result.data as { provider?: unknown }).provider).toBe("github-copilot.responses");
+      expect(result.data.constructor.name).toBe("CopilotResponsesLanguageModel");
+    });
+  });
+
+  it("returns api_key_not_found before checking a stale Copilot model catalog", async () => {
+    await withTempConfig(async (config, factory) => {
+      config.saveProvidersConfig({
+        "github-copilot": {
+          models: ["gpt-4.1"],
+        },
+      });
+
+      const result = await factory.createModel("github-copilot:gpt-5.4");
+
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error).toEqual({
+          type: "api_key_not_found",
+          provider: "github-copilot",
+        });
+      }
+    });
+  });
+
+  it("fails when the requested model is missing from the stored Copilot model list", async () => {
+    await withTempConfig(async (config, factory) => {
+      config.saveProvidersConfig({
+        "github-copilot": {
+          apiKey: "copilot-token",
+          models: ["gpt-4.1"],
+        },
+      });
+
+      const result = await factory.createModel("github-copilot:gpt-5.4");
+
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error).toEqual({
+          type: "model_not_available",
+          provider: "github-copilot",
+          modelId: "gpt-5.4",
+        });
+      }
+    });
+  });
+
+  it("allows Copilot model creation when the stored model list is malformed", async () => {
+    await withTempConfig(async (config, factory) => {
+      config.saveProvidersConfig({
+        "github-copilot": {
+          apiKey: "copilot-token",
+          models: "not-an-array",
+        },
+      } as unknown as Parameters<Config["saveProvidersConfig"]>[0]);
+
+      const result = await factory.createModel("github-copilot:gpt-5.4");
+
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        return;
+      }
+
+      expect(result.data.constructor.name).toBe("OpenAIChatLanguageModel");
+    });
+  });
+
+  it("allows Copilot model creation when the stored model list contains malformed entries", async () => {
+    await withTempConfig(async (config, factory) => {
+      config.saveProvidersConfig({
+        "github-copilot": {
+          apiKey: "copilot-token",
+          models: ["   ", null],
+        },
+      } as unknown as Parameters<Config["saveProvidersConfig"]>[0]);
+
+      const result = await factory.createModel("github-copilot:gpt-5.4");
+
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        return;
+      }
+
+      expect(result.data.constructor.name).toBe("OpenAIChatLanguageModel");
+    });
+  });
+
+  it("allows Copilot model creation when no stored model list exists yet", async () => {
+    await withTempConfig(async (config, factory) => {
+      config.saveProvidersConfig({
+        "github-copilot": {
+          apiKey: "copilot-token",
+          models: [],
+        },
+      });
+
+      const result = await factory.createModel("github-copilot:gpt-5.4");
+
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        return;
+      }
+
+      expect(result.data.constructor.name).toBe("OpenAIChatLanguageModel");
     });
   });
 });
@@ -162,6 +598,63 @@ describe("ProviderModelFactory routing", () => {
 
       const created = await factory.createModel("openai:gpt-5");
       expect(created.success).toBe(true);
+
+      const result = await factory.resolveAndCreateModel("openai:gpt-5", "off");
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        return;
+      }
+
+      expect(result.data.effectiveModelString).toBe("openrouter:openai/gpt-5");
+      expect(result.data.routeProvider).toBe("openrouter");
+      expect(result.data.routedThroughGateway).toBe(false);
+    });
+  });
+
+  it("passes gateway model accessibility to routing by skipping inaccessible Copilot models", async () => {
+    await withTempConfig(async (config, factory) => {
+      config.saveProvidersConfig({
+        openai: {
+          apiKey: "sk-test",
+        },
+        "github-copilot": {
+          apiKey: "copilot-token",
+          models: ["gpt-4.1"],
+        },
+      });
+
+      const projectConfig = config.loadConfigOrDefault();
+      await config.saveConfig({
+        ...projectConfig,
+        routePriority: ["github-copilot", "direct"],
+      });
+
+      const result = await factory.resolveAndCreateModel("openai:gpt-5.4", "off");
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        return;
+      }
+
+      expect(result.data.effectiveModelString).toBe("openai:gpt-5.4");
+      expect(result.data.routeProvider).toBe("openai");
+      expect(result.data.routedThroughGateway).toBe(false);
+    });
+  });
+
+  it("does not treat custom gateway model entries as an exhaustive routed catalog", async () => {
+    await withTempConfig(async (config, factory) => {
+      config.saveProvidersConfig({
+        openrouter: {
+          apiKey: "or-test",
+          models: ["team-only-model"],
+        },
+      });
+
+      const projectConfig = config.loadConfigOrDefault();
+      await config.saveConfig({
+        ...projectConfig,
+        routePriority: ["openrouter", "direct"],
+      });
 
       const result = await factory.resolveAndCreateModel("openai:gpt-5", "off");
       expect(result.success).toBe(true);
@@ -478,6 +971,23 @@ describe("classifyCopilotInitiator", () => {
       messages: [
         { role: "user", content: "hi" },
         { role: "assistant", content: "..." },
+      ],
+    });
+    expect(classifyCopilotInitiator(body)).toBe("agent");
+  });
+
+  it("returns 'user' when the last Responses input item is a user turn", () => {
+    const body = JSON.stringify({
+      input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }],
+    });
+    expect(classifyCopilotInitiator(body)).toBe("user");
+  });
+
+  it("returns 'agent' when the last Responses input item is a stored tool reference", () => {
+    const body = JSON.stringify({
+      input: [
+        { role: "user", content: [{ type: "input_text", text: "hello" }] },
+        { type: "item_reference", id: "fc_123" },
       ],
     });
     expect(classifyCopilotInitiator(body)).toBe("agent");
