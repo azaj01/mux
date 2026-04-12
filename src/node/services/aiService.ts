@@ -55,6 +55,8 @@ import { createErrorEvent } from "./utils/sendMessageError";
 import { createAssistantMessageId } from "./utils/messageIds";
 import type { SessionUsageService } from "./sessionUsageService";
 import { sumUsageHistory, getTotalCost } from "@/common/utils/tokens/usageAggregator";
+import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
+import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { readToolInstructions } from "./systemMessage";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import type { DevToolsService } from "@/node/services/devToolsService";
@@ -172,6 +174,29 @@ function mergeProviderExtrasUnderMux(
   }
 
   return merged;
+}
+
+function markProviderMetadataCostsIncluded(
+  providerMetadata: Record<string, unknown> | undefined,
+  costsIncluded: boolean | undefined
+): Record<string, unknown> | undefined {
+  if (!costsIncluded) {
+    return providerMetadata;
+  }
+
+  const muxMetadata = providerMetadata?.mux;
+  const existingMux =
+    muxMetadata && typeof muxMetadata === "object"
+      ? (muxMetadata as Record<string, unknown>)
+      : undefined;
+
+  return {
+    ...(providerMetadata ?? {}),
+    mux: {
+      ...(existingMux ?? {}),
+      costsIncluded: true,
+    },
+  };
 }
 
 interface ToolExecutionContext {
@@ -1287,6 +1312,10 @@ export class AIService extends EventEmitter {
       // Mutable ref updated by StreamManager.prepareStep so the advisor tool reads the live
       // transcript lazily at execute time instead of capturing a stale snapshot here.
       const advisorTranscriptRef: { messages?: ModelMessage[] } = {};
+      // Tool-side generateText() results do not consistently echo mux.costsIncluded in
+      // providerMetadata, so remember the resolved billing mode from model creation and
+      // re-stamp it before converting usage into display/session costs.
+      const toolModelCostsIncludedByModelString = new Map<string, boolean>();
       // Normalize: undefined -> default, null -> unlimited, positive int -> exact cap.
       const advisorMaxUses =
         advisorToolConfig.advisorMaxUsesPerTurn === null
@@ -1333,12 +1362,23 @@ export class AIService extends EventEmitter {
                     return messages;
                   },
                   createModel: async (ms: string) => {
-                    const advisorModel = await this.createModel(ms, undefined, { workspaceId });
+                    const advisorModelString = ms.trim();
+                    assert(
+                      advisorModelString.length > 0,
+                      "advisor model string must be non-empty when creating an advisor model"
+                    );
+                    const advisorModel = await this.createModel(advisorModelString, undefined, {
+                      workspaceId,
+                    });
                     if (!advisorModel.success) {
                       throw new Error(
                         `Failed to create advisor model: ${getErrorMessage(advisorModel.error)}`
                       );
                     }
+                    toolModelCostsIncludedByModelString.set(
+                      advisorModelString,
+                      modelCostsIncluded(advisorModel.data)
+                    );
                     return advisorModel.data;
                   },
                   abortSignal: combinedAbortSignal,
@@ -1367,6 +1407,56 @@ export class AIService extends EventEmitter {
           enableAgentReport: Boolean(metadata.parentWorkspaceId),
           // External edit detection callback
           recordFileState,
+          reportModelUsage: (event) => {
+            void (async () => {
+              try {
+                if (!this.sessionUsageService) {
+                  return;
+                }
+                const eventModel = event.model.trim();
+                assert(eventModel.length > 0, "tool model usage event model must be non-empty");
+                // Persist tool-side model usage under its own model bucket so session costs keep
+                // advisor/system-side pricing separate from the parent chat model.
+                const providerMetadata = markProviderMetadataCostsIncluded(
+                  event.providerMetadata,
+                  toolModelCostsIncludedByModelString.get(eventModel)
+                );
+                const metadataModel = resolveModelForMetadata(
+                  eventModel,
+                  this.providerService.getConfig()
+                );
+                const displayUsage = createDisplayUsage(
+                  event.usage,
+                  eventModel,
+                  providerMetadata,
+                  metadataModel
+                );
+                if (!displayUsage) {
+                  return;
+                }
+                const canonicalModel = normalizeToCanonical(eventModel);
+                await this.sessionUsageService.recordUsage(
+                  workspaceId,
+                  canonicalModel,
+                  displayUsage
+                );
+                this.emit("session-usage-delta", {
+                  type: "session-usage-delta" as const,
+                  workspaceId,
+                  sourceWorkspaceId: workspaceId,
+                  byModelDelta: { [canonicalModel]: displayUsage },
+                  timestamp: Date.now(),
+                });
+              } catch (error) {
+                log.warn("Failed to record tool model usage", {
+                  error,
+                  workspaceId,
+                  toolName: event.toolName,
+                  model: event.model,
+                });
+              }
+            })();
+          },
           onConfigChanged: () => this.providerService.notifyConfigChanged(),
           taskService: this.taskService,
           analyticsService: this.analyticsService,

@@ -45,6 +45,8 @@ import type {
   StreamAbortEvent,
   StreamEndEvent,
 } from "@/common/types/stream";
+import { log } from "./log";
+import type { SessionUsageService } from "./sessionUsageService";
 import type { StreamManager } from "./streamManager";
 import { ExperimentsService } from "./experimentsService";
 import type { DevToolsService } from "./devToolsService";
@@ -53,6 +55,9 @@ import * as agentResolution from "./agentResolution";
 import * as streamContextBuilder from "./streamContextBuilder";
 import * as messagePipeline from "./messagePipeline";
 import * as toolAssembly from "./toolAssembly";
+import type { ToolModelUsageEvent } from "@/common/utils/tools/tools";
+import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
+import { normalizeToCanonical } from "@/common/utils/ai/models";
 import * as toolsModule from "@/common/utils/tools/tools";
 import * as providerOptionsModule from "@/common/utils/ai/providerOptions";
 import * as system1ToolWrapperModule from "./system1ToolWrapper";
@@ -1165,6 +1170,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     preparedToolNamesForSentinel: string[][];
     streamSystemContextMuxScopes: MuxToolScope[];
     startStreamCalls: unknown[][];
+    getToolsForModelSpy: ReturnType<typeof spyOn<typeof toolsModule, "getToolsForModel">>;
   }
 
   function createWorkspaceMetadata(workspaceId: string, projectPath: string): WorkspaceMetadata {
@@ -1226,13 +1232,21 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       routeProvider?: ProviderName;
       allTools?: Record<string, Tool>;
       postPolicyTools?: Record<string, Tool>;
+      sessionUsageService?: SessionUsageService;
     }
   ): StreamMessageHarness {
     const config = new Config(muxHomePath);
     const historyService = new HistoryService(config);
     const initStateManager = new InitStateManager(config);
     const providerService = new ProviderService(config);
-    const service = new AIService(config, historyService, initStateManager, providerService);
+    const service = new AIService(
+      config,
+      historyService,
+      initStateManager,
+      providerService,
+      undefined,
+      options?.sessionUsageService
+    );
 
     const planPayloadMessageIds: string[][] = [];
     const preparedPayloadMessageIds: string[][] = [];
@@ -1303,7 +1317,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     });
 
     const allTools = options?.allTools ?? {};
-    spyOn(toolsModule, "getToolsForModel").mockResolvedValue(allTools);
+    const getToolsForModelSpy = spyOn(toolsModule, "getToolsForModel").mockResolvedValue(allTools);
     if (options?.postPolicyTools) {
       spyOn(toolAssembly, "applyToolPolicyAndExperiments").mockResolvedValue(
         options.postPolicyTools
@@ -1390,6 +1404,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       preparedToolNamesForSentinel,
       streamSystemContextMuxScopes,
       startStreamCalls,
+      getToolsForModelSpy,
     };
   }
 
@@ -1805,6 +1820,307 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(openaiOptions.previousResponseId).toBeUndefined();
     expect(openaiOptions.promptCacheKey).toBe(
       `mux-v1-project-under-test-${uniqueSuffix([projectPath])}`
+    );
+  });
+
+  it("resolves advisor tool metadata pricing without changing the stored model bucket", async () => {
+    using muxHome = new DisposableTempDir("ai-service-tool-model-usage");
+    const projectPath = path.join(muxHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const workspaceId = "workspace-tool-model-usage";
+    const metadata = createWorkspaceMetadata(workspaceId, projectPath);
+    const recordUsage = mock(() => Promise.resolve(undefined));
+    const getSessionUsage = mock(() => Promise.resolve(undefined));
+    const sessionUsageService = {
+      recordUsage,
+      getSessionUsage,
+    } as unknown as SessionUsageService;
+    const harness = createHarness(muxHome.path, metadata, { sessionUsageService });
+    const metadataModel = KNOWN_MODELS.SONNET.id;
+    harness.config.saveProvidersConfig({
+      anthropic: {
+        models: [{ id: "custom-sonnet", mappedToModel: metadataModel }],
+      },
+    });
+
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "continue")],
+      workspaceId,
+      modelString: "openai:gpt-5.2",
+      thinkingLevel: "off",
+    });
+
+    expect(result.success).toBe(true);
+    const toolConfig = harness.getToolsForModelSpy.mock.calls[0]?.[1];
+    if (!toolConfig || typeof toolConfig !== "object") {
+      throw new Error("Expected getToolsForModel to receive a tool configuration object");
+    }
+
+    const reportModelUsage = (
+      toolConfig as {
+        reportModelUsage?: (event: ToolModelUsageEvent) => void;
+      }
+    ).reportModelUsage;
+    expect(typeof reportModelUsage).toBe("function");
+    if (!reportModelUsage) {
+      throw new Error("Expected reportModelUsage callback on tool configuration");
+    }
+
+    const event: ToolModelUsageEvent = {
+      source: "tool",
+      toolName: "advisor",
+      model: "anthropic:custom-sonnet",
+      usage: {
+        inputTokens: 120,
+        cachedInputTokens: 10,
+        outputTokens: 45,
+        reasoningTokens: 5,
+        totalTokens: 165,
+      },
+      providerMetadata: {
+        anthropic: { cacheCreationInputTokens: 6 },
+      },
+      toolCallId: "call-1",
+      timestamp: Date.now(),
+    };
+    const unresolvedDisplayUsage = createDisplayUsage(
+      event.usage,
+      event.model,
+      event.providerMetadata
+    );
+    expect(unresolvedDisplayUsage).toBeDefined();
+    if (!unresolvedDisplayUsage) {
+      throw new Error("Expected unresolved tool usage event to produce display usage");
+    }
+    expect(unresolvedDisplayUsage.input.cost_usd).toBeUndefined();
+
+    const expectedDisplayUsage = createDisplayUsage(
+      event.usage,
+      event.model,
+      event.providerMetadata,
+      metadataModel
+    );
+    expect(expectedDisplayUsage).toBeDefined();
+    if (!expectedDisplayUsage) {
+      throw new Error("Expected tool usage event to produce display usage");
+    }
+    expect(expectedDisplayUsage.model).toBe(event.model);
+    expect(expectedDisplayUsage.input.cost_usd).toBeDefined();
+
+    const canonicalModel = normalizeToCanonical(event.model);
+    const callSequence: string[] = [];
+    let sessionUsageDeltaEvent: unknown;
+    harness.service.once("session-usage-delta", (payload) => {
+      callSequence.push("emit");
+      sessionUsageDeltaEvent = payload;
+    });
+
+    recordUsage.mockImplementationOnce(() => {
+      callSequence.push("recordUsage");
+      return Promise.resolve(undefined);
+    });
+
+    reportModelUsage(event);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(recordUsage).toHaveBeenCalledWith(workspaceId, canonicalModel, expectedDisplayUsage);
+    expect(callSequence).toEqual(["recordUsage", "emit"]);
+    expect(sessionUsageDeltaEvent).toBeDefined();
+    if (typeof sessionUsageDeltaEvent !== "object" || sessionUsageDeltaEvent === null) {
+      throw new Error("Expected session-usage-delta event payload");
+    }
+    const sessionUsageDeltaRecord = sessionUsageDeltaEvent as Record<string, unknown>;
+    expect(sessionUsageDeltaRecord.type).toBe("session-usage-delta");
+    expect(sessionUsageDeltaRecord.workspaceId).toBe(workspaceId);
+    expect(sessionUsageDeltaRecord.sourceWorkspaceId).toBe(workspaceId);
+    expect(sessionUsageDeltaRecord.byModelDelta).toEqual({
+      [canonicalModel]: expectedDisplayUsage,
+    });
+    expect(typeof sessionUsageDeltaRecord.timestamp).toBe("number");
+  });
+
+  it("zeros advisor tool usage costs for costs-included models before persisting", async () => {
+    using muxHome = new DisposableTempDir("ai-service-tool-model-usage-costs-included");
+    const projectPath = path.join(muxHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const workspaceId = "workspace-tool-model-usage-costs-included";
+    const metadata = createWorkspaceMetadata(workspaceId, projectPath);
+    const recordUsage = mock(() => Promise.resolve(undefined));
+    const getSessionUsage = mock(() => Promise.resolve(undefined));
+    const sessionUsageService = {
+      recordUsage,
+      getSessionUsage,
+    } as unknown as SessionUsageService;
+    const harness = createHarness(muxHome.path, metadata, { sessionUsageService });
+
+    harness.config.saveProvidersConfig({
+      openai: {
+        codexOauth: {
+          type: "oauth",
+          access: "test-access-token",
+          refresh: "test-refresh-token",
+          expires: Date.now() + 60_000,
+          accountId: "test-account-id",
+        },
+      },
+    });
+    const baseConfig = harness.config.loadConfigOrDefault();
+    await harness.config.saveConfig({
+      ...baseConfig,
+      advisorModelString: KNOWN_MODELS.GPT_53_CODEX.id,
+      agentAiDefaults: {
+        ...baseConfig.agentAiDefaults,
+        exec: {
+          ...baseConfig.agentAiDefaults?.exec,
+          advisorEnabled: true,
+        },
+      },
+    });
+
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "continue")],
+      workspaceId,
+      modelString: "openai:gpt-5.2",
+      thinkingLevel: "off",
+      experiments: { advisorTool: true },
+    });
+
+    expect(result.success).toBe(true);
+    const toolConfig = harness.getToolsForModelSpy.mock.calls[0]?.[1];
+    if (!toolConfig || typeof toolConfig !== "object") {
+      throw new Error("Expected getToolsForModel to receive a tool configuration object");
+    }
+
+    const advisorRuntime = (
+      toolConfig as {
+        advisorRuntime?: {
+          createModel: (modelString: string) => Promise<LanguageModel>;
+        };
+      }
+    ).advisorRuntime;
+    expect(advisorRuntime).toBeDefined();
+    if (!advisorRuntime) {
+      throw new Error("Expected advisorRuntime in tool configuration");
+    }
+    await advisorRuntime.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
+
+    const reportModelUsage = (
+      toolConfig as {
+        reportModelUsage?: (event: ToolModelUsageEvent) => void;
+      }
+    ).reportModelUsage;
+    if (!reportModelUsage) {
+      throw new Error("Expected reportModelUsage callback on tool configuration");
+    }
+
+    const event: ToolModelUsageEvent = {
+      source: "tool",
+      toolName: "advisor",
+      model: KNOWN_MODELS.GPT_53_CODEX.id,
+      usage: {
+        inputTokens: 120,
+        outputTokens: 45,
+        totalTokens: 165,
+      },
+      providerMetadata: {
+        openai: { reasoningTokens: 5 },
+      },
+      timestamp: Date.now(),
+    };
+    const expectedDisplayUsage = createDisplayUsage(event.usage, event.model, {
+      ...(event.providerMetadata ?? {}),
+      mux: { costsIncluded: true },
+    });
+    expect(expectedDisplayUsage).toBeDefined();
+    if (!expectedDisplayUsage) {
+      throw new Error("Expected tool usage event to produce display usage");
+    }
+    expect(expectedDisplayUsage.costsIncluded).toBe(true);
+    expect(expectedDisplayUsage.input.cost_usd).toBe(0);
+    expect(expectedDisplayUsage.output.cost_usd).toBe(0);
+    expect(expectedDisplayUsage.reasoning.cost_usd).toBe(0);
+
+    reportModelUsage(event);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(recordUsage).toHaveBeenCalledWith(
+      workspaceId,
+      normalizeToCanonical(event.model),
+      expectedDisplayUsage
+    );
+  });
+
+  it("logs and swallows tool model usage persistence failures", async () => {
+    using muxHome = new DisposableTempDir("ai-service-tool-model-usage-failure");
+    const projectPath = path.join(muxHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const workspaceId = "workspace-tool-model-usage-failure";
+    const metadata = createWorkspaceMetadata(workspaceId, projectPath);
+    const recordUsageError = new Error("write failed");
+    const recordUsage = mock(() => Promise.reject(recordUsageError));
+    const getSessionUsage = mock(() => Promise.resolve(undefined));
+    const sessionUsageService = {
+      recordUsage,
+      getSessionUsage,
+    } as unknown as SessionUsageService;
+    const warnSpy = spyOn(log, "warn").mockImplementation(() => undefined);
+    const harness = createHarness(muxHome.path, metadata, { sessionUsageService });
+
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "continue")],
+      workspaceId,
+      modelString: "openai:gpt-5.2",
+      thinkingLevel: "off",
+    });
+
+    expect(result.success).toBe(true);
+    const toolConfig = harness.getToolsForModelSpy.mock.calls[0]?.[1];
+    if (!toolConfig || typeof toolConfig !== "object") {
+      throw new Error("Expected getToolsForModel to receive a tool configuration object");
+    }
+
+    const reportModelUsage = (
+      toolConfig as {
+        reportModelUsage?: (event: ToolModelUsageEvent) => void;
+      }
+    ).reportModelUsage;
+    if (!reportModelUsage) {
+      throw new Error("Expected reportModelUsage callback on tool configuration");
+    }
+
+    const event: ToolModelUsageEvent = {
+      source: "tool",
+      toolName: "advisor",
+      model: "anthropic:claude-sonnet-4-20250514",
+      usage: {
+        inputTokens: 50,
+        outputTokens: 20,
+        totalTokens: 70,
+      },
+      providerMetadata: {
+        anthropic: { cacheCreationInputTokens: 2 },
+      },
+      toolCallId: "call-2",
+      timestamp: Date.now(),
+    };
+
+    reportModelUsage(event);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      "Failed to record tool model usage",
+      expect.objectContaining({
+        error: recordUsageError,
+        workspaceId,
+        toolName: "advisor",
+        model: event.model,
+      })
     );
   });
 });
